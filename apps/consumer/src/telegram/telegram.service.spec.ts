@@ -3,106 +3,88 @@ import { TelegramService } from './telegram.service';
 import { AppConfigService } from '../config/config.service';
 
 describe('TelegramService', () => {
-  let service: TelegramService;
-
-  beforeEach(async () => {
-    const mockConfig = {
-      telegramBotToken: 'test-token',
-      telegramDefaultChatId: 'default-chat',
-    };
-
-    const module: TestingModule = await Test.createTestingModule({
-      providers: [
-        TelegramService,
-        { provide: AppConfigService, useValue: mockConfig },
-      ],
-    }).compile();
-
-    service = module.get<TelegramService>(TelegramService);
-  });
-
-  it('should be defined', () => {
-    expect(service).toBeDefined();
+  const createEvent = (overrides?: Record<string, unknown>) => ({
+    eventId: 'test-uuid',
+    type: 'notification.created',
+    payload: { message: 'Hello World', chatId: '123' },
+    createdAt: '2026-05-06T12:00:00.000Z',
+    ...overrides,
   });
 
   describe('sendNotification', () => {
-    it('should return false if bot token is empty', async () => {
-      const emptyConfig = {
-        telegramBotToken: '',
-        telegramDefaultChatId: '',
-      };
+    it('should send message and resolve on success', async () => {
+      global.fetch = jest.fn().mockResolvedValue({ ok: true });
 
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           TelegramService,
-          { provide: AppConfigService, useValue: emptyConfig },
+          {
+            provide: AppConfigService,
+            useValue: {
+              telegramBotToken: 'test-token',
+              telegramDefaultChatId: 'default-chat',
+            },
+          },
         ],
       }).compile();
 
-      const emptyService = module.get<TelegramService>(TelegramService);
-      const result = await emptyService.sendNotification({
-        eventId: 'test',
-        type: 'test',
-        payload: { message: 'test' },
-        createdAt: new Date().toISOString(),
-      });
+      const service = module.get<TelegramService>(TelegramService);
+      await service.sendNotification(createEvent());
 
-      expect(result).toBe(false);
-    });
-
-    it('should format message correctly', () => {
-      const event = {
-        eventId: 'uuid-123',
-        type: 'notification.created',
-        payload: { message: 'Hello World', chatId: '123' },
-        createdAt: '2026-05-06T12:00:00.000Z',
-      };
-
-      const message = (service as any).formatMessage(event);
-
-      expect(message).toContain('Notification');
-      expect(message).toContain('notification.created');
-      expect(message).toContain('Hello World');
-      expect(message).toContain('uuid-123');
-      expect(message).toContain('2026-05-06T12:00:00.000Z');
+      const callArgs = (global.fetch as jest.Mock).mock.calls[0];
+      expect(callArgs[0]).toBe(
+        'https://api.telegram.org/bottest-token/sendMessage',
+      );
+      const body = JSON.parse(callArgs[1].body);
+      expect(body.chat_id).toBe('123');
+      expect(body.parse_mode).toBe('HTML');
     });
 
     it('should use default chatId when not in payload', async () => {
-      global.fetch = jest.fn().mockResolvedValue({
-        ok: true,
-      });
+      global.fetch = jest.fn().mockResolvedValue({ ok: true });
 
-      const event = {
-        eventId: 'test',
-        type: 'test',
-        payload: { message: 'test' },
-        createdAt: new Date().toISOString(),
-      };
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          TelegramService,
+          {
+            provide: AppConfigService,
+            useValue: {
+              telegramBotToken: 'test-token',
+              telegramDefaultChatId: 'default-chat',
+            },
+          },
+        ],
+      }).compile();
 
-      await service.sendNotification(event);
+      const service = module.get<TelegramService>(TelegramService);
+      await service.sendNotification(createEvent({ payload: { message: 'test' } }));
 
       const callArgs = (global.fetch as jest.Mock).mock.calls[0];
       const body = JSON.parse(callArgs[1].body);
       expect(body.chat_id).toBe('default-chat');
     });
 
-    it('should use payload chatId when provided', async () => {
-      global.fetch = jest.fn().mockResolvedValue({
-        ok: true,
-      });
+    it('should throw when no chatId is available', async () => {
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          TelegramService,
+          {
+            provide: AppConfigService,
+            useValue: {
+              telegramBotToken: 'test-token',
+              telegramDefaultChatId: undefined,
+            },
+          },
+        ],
+      }).compile();
 
-      const event = {
-        eventId: 'test',
-        type: 'test',
-        payload: { message: 'test', chatId: 'from-payload' },
-        createdAt: new Date().toISOString(),
-      };
+      const service = module.get<TelegramService>(TelegramService);
 
-      await service.sendNotification(event);
-
-      const callArgs = (global.fetch as jest.Mock).mock.calls[0];
-      const body = JSON.parse(callArgs[1].body);
-      expect(body.chat_id).toBe('from-payload');
+      await expect(
+        service.sendNotification(
+          createEvent({ payload: { message: 'test' } }),
+        ),
+      ).rejects.toThrow('No chatId provided');
     });
 
     it('should throw on Telegram API error', async () => {
@@ -112,16 +94,70 @@ describe('TelegramService', () => {
         text: jest.fn().mockResolvedValue('Forbidden'),
       });
 
-      const event = {
-        eventId: 'test',
-        type: 'test',
-        payload: { message: 'test', chatId: '123' },
-        createdAt: new Date().toISOString(),
-      };
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          TelegramService,
+          {
+            provide: AppConfigService,
+            useValue: {
+              telegramBotToken: 'test-token',
+              telegramDefaultChatId: 'chat',
+            },
+          },
+        ],
+      }).compile();
 
-      await expect(service.sendNotification(event)).rejects.toThrow(
-        'Telegram API error: 403',
-      );
+      const service = module.get<TelegramService>(TelegramService);
+
+      await expect(
+        service.sendNotification(createEvent()),
+      ).rejects.toThrow('Telegram API error: 403');
+    });
+  });
+
+  describe('formatMessage', () => {
+    it('should format message correctly', async () => {
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          TelegramService,
+          {
+            provide: AppConfigService,
+            useValue: {
+              telegramBotToken: 'test-token',
+              telegramDefaultChatId: 'chat',
+            },
+          },
+        ],
+      }).compile();
+
+      const service = module.get<TelegramService>(TelegramService);
+      const message = (service as any).formatMessage(createEvent());
+
+      expect(message).toContain('<b>Notification</b>');
+      expect(message).toContain('notification.created');
+      expect(message).toContain('Hello World');
+      expect(message).toContain('test-uuid');
+    });
+  });
+
+  describe('escapeHtml', () => {
+    it('should escape HTML special characters', async () => {
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          TelegramService,
+          {
+            provide: AppConfigService,
+            useValue: {
+              telegramBotToken: 'test-token',
+              telegramDefaultChatId: 'chat',
+            },
+          },
+        ],
+      }).compile();
+
+      const service = module.get<TelegramService>(TelegramService);
+      const escaped = (service as any).escapeHtml('<b>test & value</b>');
+      expect(escaped).toBe('&lt;b&gt;test &amp; value&lt;/b&gt;');
     });
   });
 });

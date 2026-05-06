@@ -30,11 +30,11 @@ export class AppConfigService {
   }
 
   get telegramBotToken(): string {
-    return this.configService.get<string>('TELEGRAM_BOT_TOKEN', '');
+    return this.configService.get<string>('TELEGRAM_BOT_TOKEN')!;
   }
 
-  get telegramDefaultChatId(): string {
-    return this.configService.get<string>('TELEGRAM_DEFAULT_CHAT_ID', '');
+  get telegramDefaultChatId(): string | undefined {
+    return this.configService.get<string>('TELEGRAM_DEFAULT_CHAT_ID');
   }
 
   get redisUrl(): string {

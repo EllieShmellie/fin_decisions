@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, IsOptional, ValidateNested } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, ValidateNested, IsDefined, IsNotEmptyObject, IsObject } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -21,6 +21,9 @@ export class CreateEventDto {
   type: string;
 
   @ApiProperty({ type: () => EventPayloadDto })
+  @IsDefined()
+  @IsNotEmptyObject()
+  @IsObject()
   @ValidateNested()
   @Type(() => EventPayloadDto)
   payload: EventPayloadDto;

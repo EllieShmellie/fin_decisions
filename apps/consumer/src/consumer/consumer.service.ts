@@ -17,16 +17,31 @@ export class ConsumerService {
       throw new Error('Invalid event structure: missing required fields');
     }
 
-    const isDuplicate = await this.redisService.isDuplicate(event.eventId);
-    if (isDuplicate) {
-      this.logger.log(`Duplicate event detected: eventId=${event.eventId}. Skipping.`);
+    if (await this.redisService.isProcessed(event.eventId)) {
+      this.logger.log(`Already processed: eventId=${event.eventId}. Skipping.`);
+      return;
+    }
+
+    const lockAcquired = await this.redisService.tryAcquireLock(event.eventId);
+    if (!lockAcquired) {
+      this.logger.log(`In-flight duplicate: eventId=${event.eventId}. Another consumer is processing.`);
       return;
     }
 
     this.logger.log(`Processing event: eventId=${event.eventId} type=${event.type}`);
 
-    await this.telegramService.sendNotification(event);
-    await this.redisService.markProcessed(event.eventId);
-    this.logger.log(`Event processed and marked as completed: eventId=${event.eventId}`);
+    try {
+      await this.telegramService.sendNotification(event);
+      await this.redisService.markProcessed(event.eventId);
+      await this.redisService.releaseLock(event.eventId);
+      this.logger.log(`Event processed and marked as completed: eventId=${event.eventId}`);
+    } catch (error) {
+      await this.redisService.releaseLock(event.eventId);
+      this.logger.error(
+        `Failed to process event: eventId=${event.eventId}`,
+        error instanceof Error ? error.message : error,
+      );
+      throw error;
+    }
   }
 }

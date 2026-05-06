@@ -11,8 +11,10 @@ describe('ConsumerService', () => {
 
   beforeEach(async () => {
     const mockRedis = {
-      isDuplicate: jest.fn(),
+      isProcessed: jest.fn(),
+      tryAcquireLock: jest.fn(),
       markProcessed: jest.fn(),
+      releaseLock: jest.fn(),
     };
 
     const mockTelegram = {
@@ -32,7 +34,9 @@ describe('ConsumerService', () => {
     telegramService = module.get(TelegramService) as jest.Mocked<TelegramService>;
   });
 
-  const createEvent = (overrides?: Partial<NotificationEvent>): NotificationEvent => ({
+  const createEvent = (
+    overrides?: Partial<NotificationEvent>,
+  ): NotificationEvent => ({
     eventId: 'test-uuid',
     type: 'notification.created',
     payload: { message: 'Test', chatId: '123' },
@@ -45,23 +49,47 @@ describe('ConsumerService', () => {
   });
 
   describe('processEvent', () => {
-    it('should skip duplicate events', async () => {
-      redisService.isDuplicate.mockResolvedValue(true);
+    it('should skip already processed events', async () => {
+      redisService.isProcessed.mockResolvedValue(true);
+
+      await service.processEvent(createEvent());
+
+      expect(redisService.tryAcquireLock).not.toHaveBeenCalled();
+      expect(telegramService.sendNotification).not.toHaveBeenCalled();
+    });
+
+    it('should skip when lock cannot be acquired (in-flight duplicate)', async () => {
+      redisService.isProcessed.mockResolvedValue(false);
+      redisService.tryAcquireLock.mockResolvedValue(false);
 
       await service.processEvent(createEvent());
 
       expect(telegramService.sendNotification).not.toHaveBeenCalled();
-      expect(redisService.markProcessed).not.toHaveBeenCalled();
     });
 
     it('should process new events and send telegram notification', async () => {
-      redisService.isDuplicate.mockResolvedValue(false);
-      telegramService.sendNotification.mockResolvedValue(true);
+      redisService.isProcessed.mockResolvedValue(false);
+      redisService.tryAcquireLock.mockResolvedValue(true);
 
       await service.processEvent(createEvent());
 
       expect(telegramService.sendNotification).toHaveBeenCalledTimes(1);
       expect(redisService.markProcessed).toHaveBeenCalledWith('test-uuid');
+      expect(redisService.releaseLock).toHaveBeenCalledWith('test-uuid');
+    });
+
+    it('should release lock and throw if telegram fails', async () => {
+      redisService.isProcessed.mockResolvedValue(false);
+      redisService.tryAcquireLock.mockResolvedValue(true);
+      const telegramError = new Error('Telegram API error: 403');
+      telegramService.sendNotification.mockRejectedValue(telegramError);
+
+      await expect(service.processEvent(createEvent())).rejects.toThrow(
+        'Telegram API error: 403',
+      );
+
+      expect(redisService.releaseLock).toHaveBeenCalledWith('test-uuid');
+      expect(redisService.markProcessed).not.toHaveBeenCalled();
     });
 
     it('should throw on invalid event structure', async () => {
@@ -70,22 +98,6 @@ describe('ConsumerService', () => {
       await expect(service.processEvent(invalidEvent)).rejects.toThrow(
         'Invalid event structure',
       );
-    });
-
-    it('should mark as processed even if telegram returns false (not configured)', async () => {
-      redisService.isDuplicate.mockResolvedValue(false);
-      telegramService.sendNotification.mockResolvedValue(false);
-
-      await service.processEvent(createEvent());
-
-      expect(redisService.markProcessed).toHaveBeenCalledWith('test-uuid');
-    });
-
-    it('should throw if telegram throws', async () => {
-      redisService.isDuplicate.mockResolvedValue(false);
-      telegramService.sendNotification.mockRejectedValue(new Error('Telegram error'));
-
-      await expect(service.processEvent(createEvent())).rejects.toThrow('Telegram error');
     });
   });
 });

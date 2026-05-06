@@ -146,22 +146,38 @@ curl -X POST http://localhost:3000/events \
 - **RETRY_DELAY_MS**: 2000ms (базовая задержка)
 - После исчерпания попыток сообщение логируется как permanently failed
 
+> **Ограничение текущей реализации**: задержка retry в DLQ реализована через `setTimeout` в consumer'е.
+> Это корректно работает для демо и единичного инстанса, но при рестарте consumer'а во время таймера
+> логика retry сбрасывается. Для production рекомендуется RabbitMQ Delayed Message Plugin
+> или TTL-based retry queues.
+
 ## Идемпотентность
 
-Consumer проверяет `eventId` в Redis перед отправкой уведомления:
+Идемпотентность реализована с атомарным lock'ом через Redis:
 
-- Если `eventId` уже существует → сообщение подтверждается (ack) без отправки в Telegram
-- Если `eventId` новый → отправка в Telegram → сохранение в Redis на 24 часа
+1. **Проверка `processed:{eventId}`** — если запись существует, событие уже было обработано → ack
+2. **SET `processing:{eventId}` NX EX 60** — атомарный lock. Если не удался → другой consumer уже обрабатывает → ack
+3. **Отправка в Telegram** — если успешно → `SET processed:{eventId} EX 86400` + `DEL processing:{eventId}`
+4. **При ошибке Telegram** — `DEL processing:{eventId}` → throw → retry/DLQ
+
+Таким образом:
+- Уже обработанные события не обрабатываются повторно
+- При одновременной обработке двумя consumer'ами lock выигрывает только один
+- При падении consumer'а во время обработки lock истечёт через 60 секунд, и событие придёт снова через DLQ
 
 ## Обработка ошибок
 
 | Сценарий | Действие |
 |----------|----------|
-| Ошибка соединения с RabbitMQ | Ошибка логируется, сервис падает (Docker restart) |
-| Ошибка Telegram API | Ошибка логируется, событие уходит в retry |
-| Невалидное событие | Ошибка логируется, событие уходит в retry |
-| Дубликат eventId | Событие подтверждается, в лог пишется duplicate |
-| Превышено число retry | Событие подтверждается, в лог пишется permanently failed |
+| Ошибка соединения с RabbitMQ (Producer) | Reconnect с exponential backoff (до 10 попыток) |
+| Ошибка соединения с RabbitMQ (Consumer) | Ошибка логируется, сервис падает (Docker restart) |
+| Ошибка Telegram API | Ошибка логируется, событие уходит в retry через DLQ |
+| Невалидное событие | Ошибка логируется, событие уходит в retry через DLQ |
+| Уже обработанный eventId (processed) | Событие подтверждается (ack), в лог пишется duplicate |
+| in-flight duplicate (processing lock занят) | Событие подтверждается (ack), в лог пишется in-flight |
+| Превышено число retry | Сообщение подтверждается, в лог пишется permanently failed |
+| TELEGRAM_BOT_TOKEN не задан | Consumer не стартует (fail-fast через config validation) |
+| Нет chatId в payload и default | Ошибка обработки события → retry через DLQ |
 
 ## Переменные окружения
 
@@ -173,8 +189,8 @@ Consumer проверяет `eventId` в Redis перед отправкой у�
 | `RABBITMQ_ROUTING_KEY` | `notifications.created` | Routing key |
 | `RABBITMQ_DLX` | `notifications.dlx` | Dead Letter Exchange |
 | `RABBITMQ_DLQ` | `notifications.dlq` | Dead Letter Queue |
-| `TELEGRAM_BOT_TOKEN` | — | Токен Telegram бота |
-| `TELEGRAM_DEFAULT_CHAT_ID` | — | Chat ID по умолчанию |
+| `TELEGRAM_BOT_TOKEN` | **обязательный** | Токен Telegram бота (fail-fast при отсутствии) |
+| `TELEGRAM_DEFAULT_CHAT_ID` | — | Chat ID по умолчанию (если не указан в payload события) |
 | `REDIS_URL` | `redis://localhost:6379` | URL подключения к Redis |
 | `MAX_RETRY_ATTEMPTS` | `3` | Максимум retry попыток |
 | `RETRY_DELAY_MS` | `2000` | Базовая задержка retry (ms) |

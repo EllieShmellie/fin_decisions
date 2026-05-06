@@ -8,6 +8,10 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RabbitmqService.name);
   private connection: ChannelModel | null = null;
   private channel: ConfirmChannel | null = null;
+  private isConnecting = false;
+  private reconnectAttempts = 0;
+  private readonly maxReconnectAttempts = 10;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly config: AppConfigService) {}
 
@@ -16,29 +20,70 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.clearReconnectTimer();
     await this.disconnect();
   }
 
   private async connect(): Promise<void> {
+    if (this.isConnecting) return;
+    this.isConnecting = true;
+
     try {
       this.connection = await connect(this.config.rabbitmqUrl);
+
+      this.connection.on('error', (err) => {
+        this.logger.error('RabbitMQ connection error', err);
+        this.scheduleReconnect();
+      });
+
+      this.connection.on('close', () => {
+        this.logger.warn('RabbitMQ connection closed');
+        this.channel = null;
+        this.connection = null;
+        this.scheduleReconnect();
+      });
+
       this.channel = await this.connection.createConfirmChannel();
 
       await this.channel.assertExchange(this.config.rabbitmqExchange, 'direct', {
         durable: true,
       });
 
+      this.reconnectAttempts = 0;
+      this.isConnecting = false;
       this.logger.log('Connected to RabbitMQ');
     } catch (error) {
+      this.isConnecting = false;
       this.logger.error('Failed to connect to RabbitMQ', error);
-      throw error;
+      this.scheduleReconnect();
     }
   }
 
-  async publish(
-    message: object,
-    routingKey?: string,
-  ): Promise<boolean> {
+  private scheduleReconnect(): void {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.logger.error(
+        `Max reconnect attempts (${this.maxReconnectAttempts}) reached. Giving up.`,
+      );
+      return;
+    }
+
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+    this.reconnectAttempts++;
+    this.logger.log(
+      `Scheduling reconnect in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
+    );
+
+    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  async publish(message: object, routingKey?: string): Promise<boolean> {
     if (!this.channel) {
       throw new Error('RabbitMQ channel is not initialized');
     }
@@ -54,12 +99,14 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     );
 
     if (!published) {
-      this.logger.warn('Failed to buffer message for RabbitMQ');
+      this.logger.warn('Failed to buffer message (backpressure). Retrying...');
       return false;
     }
 
     await this.channel.waitForConfirms();
-    this.logger.log(`Message confirmed by RabbitMQ exchange=${this.config.rabbitmqExchange} routingKey=${rk}`);
+    this.logger.log(
+      `Message confirmed by RabbitMQ: exchange=${this.config.rabbitmqExchange} routingKey=${rk}`,
+    );
     return true;
   }
 

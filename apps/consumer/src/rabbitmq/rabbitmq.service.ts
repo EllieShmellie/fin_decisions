@@ -70,7 +70,9 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       this.config.rabbitmqRoutingKey,
     );
 
-    this.logger.log(`RabbitMQ infrastructure set up: exchange=${this.config.rabbitmqExchange} queue=${this.config.rabbitmqQueue}`);
+    this.logger.log(
+      `RabbitMQ infrastructure set up: exchange=${this.config.rabbitmqExchange} queue=${this.config.rabbitmqQueue}`,
+    );
   }
 
   private async startConsuming(): Promise<void> {
@@ -99,21 +101,27 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     try {
       const content = JSON.parse(msg.content.toString());
 
-      this.logger.log(`Received event: eventId=${content.eventId} type=${content.type} retry=${retryCount}`);
+      this.logger.log(
+        `Received event: eventId=${content.eventId} type=${content.type} retry=${retryCount}`,
+      );
 
       await this.consumerService.processEvent(content);
 
       this.channel.ack(msg);
       this.logger.log(`Event processed successfully: eventId=${content.eventId}`);
     } catch (error) {
-      this.logger.error(`Failed to process event: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      this.logger.error(
+        `Failed to process event: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
 
       if (retryCount < this.config.maxRetryAttempts) {
         this.channel.nack(msg, false, false);
         this.logger.log(`Event sent to DLQ for retry: retry=${retryCount + 1}`);
       } else {
         this.channel.ack(msg);
-        this.logger.error(`Event permanently failed after ${retryCount} retry attempts`);
+        this.logger.error(
+          `Event permanently failed after ${retryCount} retry attempts`,
+        );
       }
     }
   }
@@ -121,17 +129,16 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   private async handleDlqMessage(msg: ConsumeMessage | null): Promise<void> {
     if (!msg || !this.channel) return;
 
+    const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
+    const delay = this.config.retryDelayMs * Math.pow(2, retryCount - 1);
+
+    this.logger.log(
+      `DLQ message received, scheduling retry ${retryCount} with delay ${delay}ms`,
+    );
+
     try {
-      const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
-      const delay = this.config.retryDelayMs * Math.pow(2, retryCount - 1);
-
-      this.logger.log(`DLQ message received, scheduling retry ${retryCount} with delay ${delay}ms`);
-
       await new Promise<void>((resolve) => setTimeout(resolve, delay));
-
-      this.channel.ack(msg);
-
-      const published = this.channel.publish(
+      await this.publishWithConfirm(
         this.config.rabbitmqExchange,
         this.config.rabbitmqRoutingKey,
         msg.content,
@@ -140,17 +147,32 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
           persistent: true,
         },
       );
-
-      if (published) {
-        this.logger.log(`Message re-published for retry ${retryCount}`);
-      } else {
-        this.logger.error('Failed to re-publish message from DLQ');
-      }
+      this.channel.ack(msg);
+      this.logger.log(`Message re-published for retry ${retryCount}`);
     } catch (error) {
-      this.logger.error(`Error handling DLQ message: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      if (this.channel) {
-        this.channel.nack(msg, false, false);
+      this.logger.error(
+        `Failed to re-publish message from DLQ: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
+    }
+  }
+
+  private async publishWithConfirm(
+    exchange: string,
+    routingKey: string,
+    content: Buffer,
+    options?: object,
+  ): Promise<void> {
+    if (!this.connection) throw new Error('RMQ connection not available');
+
+    const confirmChannel = await this.connection.createConfirmChannel();
+    try {
+      const published = confirmChannel.publish(exchange, routingKey, content, options);
+      if (!published) {
+        throw new Error('Failed to buffer message for republish');
       }
+      await confirmChannel.waitForConfirms();
+    } finally {
+      await confirmChannel.close();
     }
   }
 

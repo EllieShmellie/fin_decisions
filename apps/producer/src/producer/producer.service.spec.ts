@@ -8,7 +8,7 @@ describe('ProducerService', () => {
 
   beforeEach(async () => {
     const mockRabbitmq = {
-      publish: jest.fn(),
+      publish: jest.fn().mockResolvedValue(true),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -28,8 +28,6 @@ describe('ProducerService', () => {
 
   describe('sendEvent', () => {
     it('should publish event and return success response', async () => {
-      rabbitmqService.publish.mockResolvedValue(true);
-
       const dto = {
         type: 'notification.created',
         payload: { message: 'Test', chatId: '123' },

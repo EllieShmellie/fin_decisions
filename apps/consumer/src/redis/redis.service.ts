@@ -26,14 +26,31 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     this.logger.log('Disconnected from Redis');
   }
 
-  async isDuplicate(eventId: string): Promise<boolean> {
+  async isProcessed(eventId: string): Promise<boolean> {
     if (!this.client) return false;
-    const exists = await this.client.exists(`event:${eventId}`);
+    const exists = await this.client.exists(`processed:${eventId}`);
     return exists === 1;
+  }
+
+  async tryAcquireLock(eventId: string, ttlSec = 60): Promise<boolean> {
+    if (!this.client) return true;
+    const result = await this.client.set(
+      `processing:${eventId}`,
+      '1',
+      'EX',
+      ttlSec,
+      'NX',
+    );
+    return result === 'OK';
   }
 
   async markProcessed(eventId: string): Promise<void> {
     if (!this.client) return;
-    await this.client.set(`event:${eventId}`, '1', 'EX', 86400);
+    await this.client.set(`processed:${eventId}`, '1', 'EX', 86400);
+  }
+
+  async releaseLock(eventId: string): Promise<void> {
+    if (!this.client) return;
+    await this.client.del(`processing:${eventId}`);
   }
 }
