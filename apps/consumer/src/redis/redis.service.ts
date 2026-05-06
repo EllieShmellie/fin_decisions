@@ -27,13 +27,13 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   async isProcessed(eventId: string): Promise<boolean> {
-    if (!this.client) return false;
+    if (!this.client) throw new Error('Redis client not available');
     const exists = await this.client.exists(`processed:${eventId}`);
     return exists === 1;
   }
 
   async tryAcquireLock(eventId: string, ttlSec = 60): Promise<boolean> {
-    if (!this.client) return true;
+    if (!this.client) throw new Error('Redis client not available');
     const result = await this.client.set(
       `processing:${eventId}`,
       '1',
@@ -45,12 +45,12 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   async markProcessed(eventId: string): Promise<void> {
-    if (!this.client) return;
+    if (!this.client) throw new Error('Redis client not available');
     await this.client.set(`processed:${eventId}`, '1', 'EX', 86400);
   }
 
   async releaseLock(eventId: string): Promise<void> {
-    if (!this.client) return;
+    if (!this.client) throw new Error('Redis client not available');
     await this.client.del(`processing:${eventId}`);
   }
 }

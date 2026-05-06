@@ -25,7 +25,7 @@ export class ConsumerService {
     const lockAcquired = await this.redisService.tryAcquireLock(event.eventId);
     if (!lockAcquired) {
       this.logger.log(`In-flight duplicate: eventId=${event.eventId}. Another consumer is processing.`);
-      return;
+      throw new Error('In-flight duplicate: event is being processed by another consumer');
     }
 
     this.logger.log(`Processing event: eventId=${event.eventId} type=${event.type}`);

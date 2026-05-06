@@ -9,6 +9,10 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RabbitmqService.name);
   private connection: ChannelModel | null = null;
   private channel: Channel | null = null;
+  private isConnecting = false;
+  private reconnectAttempts = 0;
+  private readonly maxReconnectAttempts = 10;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly config: AppConfigService,
@@ -17,23 +21,69 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleInit(): Promise<void> {
     await this.connect();
-    await this.setupInfrastructure();
-    await this.startConsuming();
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.clearReconnectTimer();
     await this.disconnect();
   }
 
   private async connect(): Promise<void> {
+    if (this.isConnecting) return;
+    this.isConnecting = true;
+
     try {
       this.connection = await connect(this.config.rabbitmqUrl);
+
+      this.connection.on('error', (err) => {
+        this.logger.error('RabbitMQ connection error', err);
+        this.scheduleReconnect();
+      });
+
+      this.connection.on('close', () => {
+        this.logger.warn('RabbitMQ connection closed');
+        this.channel = null;
+        this.connection = null;
+        this.scheduleReconnect();
+      });
+
       this.channel = await this.connection.createChannel();
       this.channel.prefetch(1);
+
+      await this.setupInfrastructure();
+      await this.startConsuming();
+
+      this.reconnectAttempts = 0;
+      this.isConnecting = false;
       this.logger.log('Connected to RabbitMQ');
     } catch (error) {
+      this.isConnecting = false;
       this.logger.error('Failed to connect to RabbitMQ', error);
-      throw error;
+      this.scheduleReconnect();
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.logger.error(
+        `Max reconnect attempts (${this.maxReconnectAttempts}) reached. Giving up.`,
+      );
+      return;
+    }
+
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+    this.reconnectAttempts++;
+    this.logger.log(
+      `Scheduling reconnect in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
+    );
+
+    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
   }
 
@@ -130,11 +180,16 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     if (!msg || !this.channel) return;
 
     const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
-    const delay = this.config.retryDelayMs * Math.pow(2, retryCount - 1);
 
-    this.logger.log(
-      `DLQ message received, scheduling retry ${retryCount} with delay ${delay}ms`,
-    );
+    if (retryCount > this.config.maxRetryAttempts) {
+      this.logger.warn(
+        `Retry exhausted for DLQ message, parking permanently (retry=${retryCount})`,
+      );
+      this.channel.ack(msg);
+      return;
+    }
+
+    const delay = this.config.retryDelayMs * Math.pow(2, retryCount - 1);
 
     try {
       await new Promise<void>((resolve) => setTimeout(resolve, delay));
@@ -153,6 +208,7 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(
         `Failed to re-publish message from DLQ: ${error instanceof Error ? error.message : 'Unknown error'}`,
       );
+      this.channel.nack(msg, false, false);
     }
   }
 

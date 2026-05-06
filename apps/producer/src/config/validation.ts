@@ -9,8 +9,5 @@ export const validationSchema = Joi.object({
   RABBITMQ_DLQ: Joi.string().optional(),
   MAX_RETRY_ATTEMPTS: Joi.number().default(3),
   PRODUCER_PORT: Joi.number().default(3000),
-  TELEGRAM_BOT_TOKEN: Joi.string().optional(),
-  TELEGRAM_DEFAULT_CHAT_ID: Joi.string().optional(),
-  REDIS_URL: Joi.string().optional(),
   RETRY_DELAY_MS: Joi.number().default(2000),
 });

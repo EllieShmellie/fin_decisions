@@ -91,23 +91,23 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     const buffer = Buffer.from(JSON.stringify(message));
     const rk = routingKey || this.config.rabbitmqRoutingKey;
 
-    const published = this.channel.publish(
+    this.channel.publish(
       this.config.rabbitmqExchange,
       rk,
       buffer,
       { persistent: true },
     );
 
-    if (!published) {
-      this.logger.warn('Failed to buffer message (backpressure). Retrying...');
+    try {
+      await this.channel.waitForConfirms();
+      this.logger.log(
+        `Message confirmed by RabbitMQ: exchange=${this.config.rabbitmqExchange} routingKey=${rk}`,
+      );
+      return true;
+    } catch (error) {
+      this.logger.error('Broker rejected or channel error during confirm', error);
       return false;
     }
-
-    await this.channel.waitForConfirms();
-    this.logger.log(
-      `Message confirmed by RabbitMQ: exchange=${this.config.rabbitmqExchange} routingKey=${rk}`,
-    );
-    return true;
   }
 
   private async disconnect(): Promise<void> {

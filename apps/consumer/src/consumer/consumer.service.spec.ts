@@ -58,11 +58,13 @@ describe('ConsumerService', () => {
       expect(telegramService.sendNotification).not.toHaveBeenCalled();
     });
 
-    it('should skip when lock cannot be acquired (in-flight duplicate)', async () => {
+    it('should throw when lock cannot be acquired (in-flight duplicate)', async () => {
       redisService.isProcessed.mockResolvedValue(false);
       redisService.tryAcquireLock.mockResolvedValue(false);
 
-      await service.processEvent(createEvent());
+      await expect(service.processEvent(createEvent())).rejects.toThrow(
+        'In-flight duplicate',
+      );
 
       expect(telegramService.sendNotification).not.toHaveBeenCalled();
     });
