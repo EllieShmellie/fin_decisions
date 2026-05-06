@@ -165,7 +165,7 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       );
 
       if (retryCount < this.config.maxRetryAttempts) {
-        this.channel.nack(msg, false, false);
+      this.channel.nack(msg, false, true);
         this.logger.log(`Event sent to DLQ for retry: retry=${retryCount + 1}`);
       } else {
         this.channel.ack(msg);
@@ -223,9 +223,13 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     const confirmChannel = await this.connection.createConfirmChannel();
     try {
       const published = confirmChannel.publish(exchange, routingKey, content, options);
+
       if (!published) {
-        throw new Error('Failed to buffer message for republish');
+        await new Promise<void>((resolve) =>
+          confirmChannel.once('drain', resolve),
+        );
       }
+
       await confirmChannel.waitForConfirms();
     } finally {
       await confirmChannel.close();

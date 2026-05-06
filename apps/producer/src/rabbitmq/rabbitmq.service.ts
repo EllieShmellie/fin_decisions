@@ -91,12 +91,19 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     const buffer = Buffer.from(JSON.stringify(message));
     const rk = routingKey || this.config.rabbitmqRoutingKey;
 
-    this.channel.publish(
+    const published = this.channel.publish(
       this.config.rabbitmqExchange,
       rk,
       buffer,
       { persistent: true },
     );
+
+    if (!published) {
+      this.logger.warn('Backpressure detected, waiting for drain');
+      await new Promise<void>((resolve) =>
+        this.channel!.once('drain', resolve),
+      );
+    }
 
     try {
       await this.channel.waitForConfirms();
