@@ -1,5 +1,5 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
-import { connect, Channel } from 'amqplib';
+import { connect, ConfirmChannel } from 'amqplib';
 import type { ChannelModel } from 'amqplib';
 import { AppConfigService } from '../config/config.service';
 
@@ -7,7 +7,7 @@ import { AppConfigService } from '../config/config.service';
 export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RabbitmqService.name);
   private connection: ChannelModel | null = null;
-  private channel: Channel | null = null;
+  private channel: ConfirmChannel | null = null;
 
   constructor(private readonly config: AppConfigService) {}
 
@@ -22,7 +22,7 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   private async connect(): Promise<void> {
     try {
       this.connection = await connect(this.config.rabbitmqUrl);
-      this.channel = await this.connection.createChannel();
+      this.channel = await this.connection.createConfirmChannel();
 
       await this.channel.assertExchange(this.config.rabbitmqExchange, 'direct', {
         durable: true,
@@ -46,15 +46,21 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     const buffer = Buffer.from(JSON.stringify(message));
     const rk = routingKey || this.config.rabbitmqRoutingKey;
 
-    const result = this.channel.publish(
+    const published = this.channel.publish(
       this.config.rabbitmqExchange,
       rk,
       buffer,
       { persistent: true },
     );
 
-    this.logger.log(`Message published to exchange=${this.config.rabbitmqExchange} routingKey=${rk}`);
-    return result;
+    if (!published) {
+      this.logger.warn('Failed to buffer message for RabbitMQ');
+      return false;
+    }
+
+    await this.channel.waitForConfirms();
+    this.logger.log(`Message confirmed by RabbitMQ exchange=${this.config.rabbitmqExchange} routingKey=${rk}`);
+    return true;
   }
 
   private async disconnect(): Promise<void> {

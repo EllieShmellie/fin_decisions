@@ -25,11 +25,8 @@ export class ConsumerService {
 
     this.logger.log(`Processing event: eventId=${event.eventId} type=${event.type}`);
 
-    const sent = await this.telegramService.sendNotification(event);
-
-    if (sent) {
-      await this.redisService.markProcessed(event.eventId);
-      this.logger.log(`Event processed and marked as completed: eventId=${event.eventId}`);
-    }
+    await this.telegramService.sendNotification(event);
+    await this.redisService.markProcessed(event.eventId);
+    this.logger.log(`Event processed and marked as completed: eventId=${event.eventId}`);
   }
 }

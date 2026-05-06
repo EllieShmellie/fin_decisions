@@ -72,13 +72,13 @@ describe('ConsumerService', () => {
       );
     });
 
-    it('should not mark as processed if telegram send fails', async () => {
+    it('should mark as processed even if telegram returns false (not configured)', async () => {
       redisService.isDuplicate.mockResolvedValue(false);
       telegramService.sendNotification.mockResolvedValue(false);
 
       await service.processEvent(createEvent());
 
-      expect(redisService.markProcessed).not.toHaveBeenCalled();
+      expect(redisService.markProcessed).toHaveBeenCalledWith('test-uuid');
     });
 
     it('should throw if telegram throws', async () => {

@@ -129,7 +129,9 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
 
       await new Promise<void>((resolve) => setTimeout(resolve, delay));
 
-      const published = this.channel!.publish(
+      this.channel.ack(msg);
+
+      const published = this.channel.publish(
         this.config.rabbitmqExchange,
         this.config.rabbitmqRoutingKey,
         msg.content,
@@ -140,15 +142,15 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       );
 
       if (published) {
-        this.channel.ack(msg);
         this.logger.log(`Message re-published for retry ${retryCount}`);
       } else {
         this.logger.error('Failed to re-publish message from DLQ');
-        this.channel.nack(msg, false, false);
       }
     } catch (error) {
       this.logger.error(`Error handling DLQ message: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      this.channel!.nack(msg, false, false);
+      if (this.channel) {
+        this.channel.nack(msg, false, false);
+      }
     }
   }
 

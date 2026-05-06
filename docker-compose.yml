@@ -33,11 +33,16 @@ services:
     container_name: fin-producer
     ports:
       - "3000:3000"
-    env_file:
-      - .env
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      RABBITMQ_EXCHANGE: notifications.exchange
+      RABBITMQ_QUEUE: notifications.queue
+      RABBITMQ_ROUTING_KEY: notifications.created
+      RABBITMQ_DLX: notifications.dlx
+      RABBITMQ_DLQ: notifications.dlq
       PRODUCER_PORT: 3000
+      MAX_RETRY_ATTEMPTS: 3
+      RETRY_DELAY_MS: 2000
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -50,11 +55,18 @@ services:
       context: .
       dockerfile: apps/consumer/Dockerfile
     container_name: fin-consumer
-    env_file:
-      - .env
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
+      RABBITMQ_EXCHANGE: notifications.exchange
+      RABBITMQ_QUEUE: notifications.queue
+      RABBITMQ_ROUTING_KEY: notifications.created
+      RABBITMQ_DLX: notifications.dlx
+      RABBITMQ_DLQ: notifications.dlq
       REDIS_URL: redis://redis:6379
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_DEFAULT_CHAT_ID: ${TELEGRAM_DEFAULT_CHAT_ID:-}
+      MAX_RETRY_ATTEMPTS: 3
+      RETRY_DELAY_MS: 2000
     depends_on:
       rabbitmq:
         condition: service_healthy
