@@ -165,7 +165,7 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       );
 
       if (retryCount < this.config.maxRetryAttempts) {
-      this.channel.nack(msg, false, true);
+        this.channel.nack(msg, false, false);
         this.logger.log(`Event sent to DLQ for retry: retry=${retryCount + 1}`);
       } else {
         this.channel.ack(msg);
@@ -208,7 +208,7 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(
         `Failed to re-publish message from DLQ: ${error instanceof Error ? error.message : 'Unknown error'}`,
       );
-      this.channel.nack(msg, false, false);
+      this.channel.nack(msg, false, true);
     }
   }
 
