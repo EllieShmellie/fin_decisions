@@ -2,8 +2,6 @@ process.env.RABBITMQ_URL = 'amqp://localhost:5672';
 process.env.RABBITMQ_EXCHANGE = 'test.exchange';
 process.env.RABBITMQ_QUEUE = 'test.queue';
 process.env.RABBITMQ_ROUTING_KEY = 'test.key';
-process.env.RABBITMQ_DLX = 'test.dlx';
-process.env.RABBITMQ_DLQ = 'test.dlq';
 
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';

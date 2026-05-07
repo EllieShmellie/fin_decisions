@@ -1,9 +1,11 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { Redis } from 'ioredis';
 import { AppConfigService } from '../config/config.service';
+import { IdempotencyStore } from '../consumer/consumer.ports';
 
 @Injectable()
-export class RedisService implements OnModuleInit, OnModuleDestroy {
+export class RedisService implements OnModuleInit, OnModuleDestroy, IdempotencyStore {
   private readonly logger = new Logger(RedisService.name);
   private client: Redis | null = null;
 
@@ -32,25 +34,31 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
     return exists === 1;
   }
 
-  async tryAcquireLock(eventId: string, ttlSec = 60): Promise<boolean> {
+  async tryAcquireLock(eventId: string, ttlSec = 60): Promise<string | null> {
     if (!this.client) throw new Error('Redis client not available');
-    const result = await this.client.set(
-      `processing:${eventId}`,
-      '1',
-      'EX',
-      ttlSec,
-      'NX',
-    );
-    return result === 'OK';
+    const token = randomUUID();
+    const result = await this.client.set(`processing:${eventId}`, token, 'EX', ttlSec, 'NX');
+    return result === 'OK' ? token : null;
   }
 
-  async markProcessed(eventId: string): Promise<void> {
+  async completeProcessing(eventId: string, lockToken: string): Promise<void> {
     if (!this.client) throw new Error('Redis client not available');
     await this.client.set(`processed:${eventId}`, '1', 'EX', 86400);
+    await this.releaseLock(eventId, lockToken);
   }
 
-  async releaseLock(eventId: string): Promise<void> {
+  async releaseLock(eventId: string, lockToken: string): Promise<void> {
     if (!this.client) throw new Error('Redis client not available');
-    await this.client.del(`processing:${eventId}`);
+    await this.client.eval(
+      `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      end
+      return 0
+      `,
+      1,
+      `processing:${eventId}`,
+      lockToken,
+    );
   }
 }

@@ -60,6 +60,11 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   }
 
   private scheduleReconnect(): void {
+    if (this.reconnectTimer) {
+      this.logger.log('Reconnect already scheduled');
+      return;
+    }
+
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.logger.error(
         `Max reconnect attempts (${this.maxReconnectAttempts}) reached. Giving up.`,
@@ -73,7 +78,10 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       `Scheduling reconnect in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
     );
 
-    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect();
+    }, delay);
   }
 
   private clearReconnectTimer(): void {
@@ -91,29 +99,57 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     const buffer = Buffer.from(JSON.stringify(message));
     const rk = routingKey || this.config.rabbitmqRoutingKey;
 
-    const published = this.channel.publish(
-      this.config.rabbitmqExchange,
-      rk,
-      buffer,
-      { persistent: true },
-    );
+    const published = this.channel.publish(this.config.rabbitmqExchange, rk, buffer, {
+      persistent: true,
+    });
 
     if (!published) {
       this.logger.warn('Backpressure detected, waiting for drain');
-      await new Promise<void>((resolve) =>
-        this.channel!.once('drain', resolve),
-      );
+      await new Promise<void>((resolve) => this.channel!.once('drain', resolve));
     }
 
     try {
-      await this.channel.waitForConfirms();
+      await this.waitForConfirmOrTimeout();
       this.logger.log(
         `Message confirmed by RabbitMQ: exchange=${this.config.rabbitmqExchange} routingKey=${rk}`,
       );
       return true;
     } catch (error) {
       this.logger.error('Broker rejected or channel error during confirm', error);
+      await this.closeUnclearChannel();
       return false;
+    }
+  }
+
+  private async waitForConfirmOrTimeout(): Promise<void> {
+    if (!this.channel) throw new Error('RabbitMQ channel is not initialized');
+
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    try {
+      await Promise.race([
+        this.channel.waitForConfirms(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error('RabbitMQ confirm timeout')),
+            this.config.rabbitmqConfirmTimeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  private async closeUnclearChannel(): Promise<void> {
+    try {
+      await this.channel?.close();
+    } catch (error) {
+      this.logger.warn(
+        `Failed to close unclear confirm channel: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      );
+    } finally {
+      this.channel = null;
+      this.scheduleReconnect();
     }
   }
 

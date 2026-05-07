@@ -3,10 +3,10 @@ services:
     image: rabbitmq:3-management-alpine
     container_name: fin-rabbitmq
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - '5672:5672'
+      - '15672:15672'
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      test: ['CMD', 'rabbitmq-diagnostics', 'check_port_connectivity']
       interval: 10s
       timeout: 5s
       retries: 5
@@ -17,9 +17,9 @@ services:
     image: redis:7-alpine
     container_name: fin-redis
     ports:
-      - "6379:6379"
+      - '6379:6379'
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ['CMD', 'redis-cli', 'ping']
       interval: 10s
       timeout: 5s
       retries: 5
@@ -32,14 +32,13 @@ services:
       dockerfile: apps/producer/Dockerfile
     container_name: fin-producer
     ports:
-      - "3000:3000"
+      - '3000:3000'
     environment:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       RABBITMQ_EXCHANGE: notifications.exchange
       RABBITMQ_QUEUE: notifications.queue
       RABBITMQ_ROUTING_KEY: notifications.created
-      RABBITMQ_DLX: notifications.dlx
-      RABBITMQ_DLQ: notifications.dlq
+      RABBITMQ_CONFIRM_TIMEOUT_MS: 5000
       PRODUCER_PORT: 3000
       MAX_RETRY_ATTEMPTS: 3
       RETRY_DELAY_MS: 2000
@@ -60,11 +59,17 @@ services:
       RABBITMQ_EXCHANGE: notifications.exchange
       RABBITMQ_QUEUE: notifications.queue
       RABBITMQ_ROUTING_KEY: notifications.created
-      RABBITMQ_DLX: notifications.dlx
-      RABBITMQ_DLQ: notifications.dlq
+      RABBITMQ_RETRY_EXCHANGE: notifications.retry.exchange
+      RABBITMQ_RETRY_QUEUE: notifications.retry.queue
+      RABBITMQ_RETRY_ROUTING_KEY: notifications.retry
+      RABBITMQ_PARKING_EXCHANGE: notifications.parking.exchange
+      RABBITMQ_PARKING_QUEUE: notifications.parking.queue
+      RABBITMQ_PARKING_ROUTING_KEY: notifications.parking
+      RABBITMQ_CONFIRM_TIMEOUT_MS: 5000
       REDIS_URL: redis://redis:6379
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_DEFAULT_CHAT_ID: ${TELEGRAM_DEFAULT_CHAT_ID:-}
+      TELEGRAM_REQUEST_TIMEOUT_MS: 5000
       MAX_RETRY_ATTEMPTS: 3
       RETRY_DELAY_MS: 2000
     depends_on:

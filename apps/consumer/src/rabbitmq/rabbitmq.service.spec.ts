@@ -1,16 +1,18 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ConsumeMessage } from 'amqplib';
 import { RabbitmqService } from './rabbitmq.service';
 import { ConsumerService } from '../consumer/consumer.service';
 import { AppConfigService } from '../config/config.service';
-import { ConsumeMessage } from 'amqplib';
+import { PermanentProcessingError } from '../consumer/processing.errors';
 
-describe('RabbitmqService — retry flow', () => {
+describe('RabbitmqService — retry and parking flow', () => {
   let service: RabbitmqService;
   let consumerService: jest.Mocked<ConsumerService>;
   let mockChannel: { ack: jest.Mock; nack: jest.Mock };
 
   function createMsg(
     retryCount = 0,
+    headers: Record<string, unknown> = {},
     overrides?: Partial<Record<string, unknown>>,
   ): ConsumeMessage {
     return {
@@ -24,7 +26,10 @@ describe('RabbitmqService — retry flow', () => {
         }),
       ),
       properties: {
-        headers: { 'x-retry-count': retryCount } as Record<string, unknown>,
+        headers: { ...headers, 'x-retry-count': retryCount },
+        contentType: 'application/json',
+        correlationId: 'correlation-1',
+        messageId: 'message-1',
       },
       fields: {
         deliveryTag: 1,
@@ -50,13 +55,16 @@ describe('RabbitmqService — retry flow', () => {
           useValue: {
             maxRetryAttempts: 3,
             retryDelayMs: 2000,
-            rabbitmqExchange: 'test.exchange',
-            rabbitmqRoutingKey: 'test.key',
-            rabbitmqDlx: 'test.dlx',
-            rabbitmqDlq: 'test.dlq',
-            rabbitmqQueue: 'test.queue',
-            telegramBotToken: 'test-token',
-            redisUrl: 'redis://localhost:6379',
+            rabbitmqExchange: 'main.exchange',
+            rabbitmqRoutingKey: 'main.key',
+            rabbitmqRetryExchange: 'retry.exchange',
+            rabbitmqRetryRoutingKey: 'retry.key',
+            rabbitmqRetryQueue: 'retry.queue',
+            rabbitmqParkingExchange: 'parking.exchange',
+            rabbitmqParkingRoutingKey: 'parking.key',
+            rabbitmqParkingQueue: 'parking.queue',
+            rabbitmqConfirmTimeoutMs: 100,
+            rabbitmqQueue: 'main.queue',
             rabbitmqUrl: 'amqp://localhost',
           },
         },
@@ -65,87 +73,137 @@ describe('RabbitmqService — retry flow', () => {
 
     service = module.get<RabbitmqService>(RabbitmqService);
     consumerService = module.get(ConsumerService) as jest.Mocked<ConsumerService>;
-
     mockChannel = {
       ack: jest.fn(),
       nack: jest.fn(),
     };
+    (service as any).channel = mockChannel;
   });
 
-  describe('handleMessage (main queue)', () => {
-    it('should ack on success', async () => {
-      const msg = createMsg(0);
-      (service as any).channel = mockChannel;
+  it('acks original message on successful processing', async () => {
+    const msg = createMsg();
 
-      await (service as any).handleMessage(msg);
+    await (service as any).handleMessage(msg);
 
-      expect(mockChannel.ack).toHaveBeenCalledWith(msg);
-    });
-
-    it('should nack(false,false) — route to DLX/DLQ on processing failure', async () => {
-      consumerService.processEvent.mockRejectedValueOnce(new Error('fail'));
-      const msg = createMsg(0);
-      (service as any).channel = mockChannel;
-
-      await (service as any).handleMessage(msg);
-
-      expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, false);
-    });
-
-    it('should ack permanently when retryCount >= maxRetryAttempts', async () => {
-      consumerService.processEvent.mockRejectedValueOnce(new Error('fail'));
-      const msg = createMsg(3);
-      (service as any).channel = mockChannel;
-
-      await (service as any).handleMessage(msg);
-
-      expect(mockChannel.ack).toHaveBeenCalledWith(msg);
-    });
+    expect(mockChannel.ack).toHaveBeenCalledWith(msg);
+    expect(mockChannel.nack).not.toHaveBeenCalled();
   });
 
-  describe('handleDlqMessage (DLQ)', () => {
-    it('should ack parked when retryCount > max', async () => {
-      const msg = createMsg(3); // 3+1=4 > max=3 → ack parked
-      (service as any).channel = mockChannel;
+  it('publishes retry message with incremented retry count before ack', async () => {
+    consumerService.processEvent.mockRejectedValueOnce(new Error('temporary'));
+    (service as any).publishWithConfirm = jest.fn().mockResolvedValue(undefined);
+    const msg = createMsg(1, { 'x-original-header': 'kept' });
 
-      await (service as any).handleDlqMessage(msg);
+    await (service as any).handleMessage(msg);
 
-      expect(mockChannel.ack).toHaveBeenCalledWith(msg);
-    });
+    expect((service as any).publishWithConfirm).toHaveBeenCalledWith(
+      'retry.exchange',
+      'retry.key',
+      msg.content,
+      expect.objectContaining({
+        persistent: true,
+        correlationId: 'correlation-1',
+        messageId: 'message-1',
+        headers: expect.objectContaining({
+          'x-original-header': 'kept',
+          'x-retry-count': 2,
+        }),
+      }),
+    );
+    expect(mockChannel.ack).toHaveBeenCalledWith(msg);
+  });
 
-    it('should nack(false,true) — requeue in DLQ on republish failure', async () => {
-      jest.useFakeTimers();
-      (service as any).publishWithConfirm = jest
-        .fn()
-        .mockRejectedValueOnce(new Error('confirm error'));
+  it('does not ack and requeues original when retry publish fails', async () => {
+    consumerService.processEvent.mockRejectedValueOnce(new Error('temporary'));
+    (service as any).publishWithConfirm = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('confirm error'));
+    const msg = createMsg(0);
 
-      const msg = createMsg(0);
-      (service as any).channel = mockChannel;
+    await (service as any).handleMessage(msg);
 
-      const handlePromise = (service as any).handleDlqMessage(msg);
-      jest.advanceTimersByTime(10000);
-      await handlePromise;
+    expect(mockChannel.ack).not.toHaveBeenCalled();
+    expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, true);
+  });
 
-      expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, true);
-      jest.useRealTimers();
-    });
+  it('publishes to parking before ack on exhausted retries', async () => {
+    consumerService.processEvent.mockRejectedValueOnce(new Error('exhausted'));
+    (service as any).publishWithConfirm = jest.fn().mockResolvedValue(undefined);
+    const msg = createMsg(3, { 'x-original-header': 'kept' });
 
-    it('should ack and republish on success', async () => {
-      jest.useFakeTimers();
-      (service as any).publishWithConfirm = jest
-        .fn()
-        .mockResolvedValueOnce(undefined);
+    await (service as any).handleMessage(msg);
 
-      const msg = createMsg(0);
-      (service as any).channel = mockChannel;
+    expect((service as any).publishWithConfirm).toHaveBeenCalledWith(
+      'parking.exchange',
+      'parking.key',
+      msg.content,
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          'x-original-header': 'kept',
+          'x-retry-count': 3,
+          'x-parking-reason': 'exhausted',
+        }),
+      }),
+    );
+    expect(mockChannel.ack).toHaveBeenCalledWith(msg);
+  });
 
-      const handlePromise = (service as any).handleDlqMessage(msg);
-      jest.advanceTimersByTime(10000);
-      await handlePromise;
+  it('parks permanent errors without retry', async () => {
+    consumerService.processEvent.mockRejectedValueOnce(new PermanentProcessingError('bad event'));
+    (service as any).publishWithConfirm = jest.fn().mockResolvedValue(undefined);
+    const msg = createMsg(0);
 
-      expect(mockChannel.ack).toHaveBeenCalledWith(msg);
-      expect((service as any).publishWithConfirm).toHaveBeenCalled();
-      jest.useRealTimers();
-    });
+    await (service as any).handleMessage(msg);
+
+    expect((service as any).publishWithConfirm).toHaveBeenCalledWith(
+      'parking.exchange',
+      'parking.key',
+      msg.content,
+      expect.any(Object),
+    );
+    expect(mockChannel.ack).toHaveBeenCalledWith(msg);
+  });
+
+  it('does not ack and requeues original when parking publish fails', async () => {
+    consumerService.processEvent.mockRejectedValueOnce(new PermanentProcessingError('bad event'));
+    (service as any).publishWithConfirm = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('confirm error'));
+    const msg = createMsg(0);
+
+    await (service as any).handleMessage(msg);
+
+    expect(mockChannel.ack).not.toHaveBeenCalled();
+    expect(mockChannel.nack).toHaveBeenCalledWith(msg, false, true);
+  });
+
+  it('parks invalid JSON as permanent failure', async () => {
+    (service as any).publishWithConfirm = jest.fn().mockResolvedValue(undefined);
+    const msg = createMsg();
+    msg.content = Buffer.from('{not-json');
+
+    await (service as any).handleMessage(msg);
+
+    expect(consumerService.processEvent).not.toHaveBeenCalled();
+    expect((service as any).publishWithConfirm).toHaveBeenCalledWith(
+      'parking.exchange',
+      'parking.key',
+      msg.content,
+      expect.any(Object),
+    );
+    expect(mockChannel.ack).toHaveBeenCalledWith(msg);
+  });
+
+  it('times out unclear confirm state', async () => {
+    jest.useFakeTimers();
+    const confirmChannel = {
+      waitForConfirms: jest.fn(() => new Promise<void>(() => undefined)),
+    };
+
+    const waitPromise = (service as any).waitForConfirmOrTimeout(confirmChannel);
+    jest.advanceTimersByTime(100);
+
+    await expect(waitPromise).rejects.toThrow('RabbitMQ confirm timeout');
+    jest.useRealTimers();
   });
 });

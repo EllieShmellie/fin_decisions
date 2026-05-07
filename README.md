@@ -19,12 +19,12 @@
 
 ### Компоненты
 
-| Сервис | Назначение | Порт |
-|--------|-----------|------|
-| **Producer** | HTTP API для отправки событий в RabbitMQ | 3000 |
-| **Consumer** | Получение событий из RMQ, обработка, отправка в Telegram | — |
-| **RabbitMQ** | Брокер сообщений, retry через DLQ | 5672 |
-| **Redis** | Хранение обработанных eventId (идемпотентность) | 6379 |
+| Сервис       | Назначение                                               | Порт |
+| ------------ | -------------------------------------------------------- | ---- |
+| **Producer** | HTTP API для отправки событий в RabbitMQ                 | 3000 |
+| **Consumer** | Получение событий из RMQ, обработка, отправка в Telegram | —    |
+| **RabbitMQ** | Брокер сообщений, TTL retry queue и parking queue        | 5672 |
+| **Redis**    | Хранение обработанных eventId (идемпотентность)          | 6379 |
 
 ## Быстрый старт
 
@@ -46,10 +46,18 @@ RABBITMQ_URL=amqp://guest:guest@localhost:5672
 RABBITMQ_EXCHANGE=notifications.exchange
 RABBITMQ_QUEUE=notifications.queue
 RABBITMQ_ROUTING_KEY=notifications.created
+RABBITMQ_RETRY_EXCHANGE=notifications.retry.exchange
+RABBITMQ_RETRY_QUEUE=notifications.retry.queue
+RABBITMQ_RETRY_ROUTING_KEY=notifications.retry
+RABBITMQ_PARKING_EXCHANGE=notifications.parking.exchange
+RABBITMQ_PARKING_QUEUE=notifications.parking.queue
+RABBITMQ_PARKING_ROUTING_KEY=notifications.parking
+RABBITMQ_CONFIRM_TIMEOUT_MS=5000
 
 # Telegram (обязательно для отправки)
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_DEFAULT_CHAT_ID=your_chat_id_here
+TELEGRAM_REQUEST_TIMEOUT_MS=5000
 
 # Redis
 REDIS_URL=redis://localhost:6379
@@ -66,6 +74,7 @@ docker compose up --build
 ```
 
 Сервисы, которые запустятся:
+
 - **Producer** — http://localhost:3000
 - **RabbitMQ Management** — http://localhost:15672 (guest/guest)
 - **Redis**
@@ -118,83 +127,83 @@ curl -X POST http://localhost:3000/events \
 
 **Тело запроса:**
 
-| Поле | Тип | Обязательное | Описание |
-|------|-----|-------------|----------|
-| type | string | да | Тип события (например, `notification.created`) |
-| payload.message | string | да | Текст уведомления |
-| payload.chatId | string | нет | Telegram chat ID (если не указан, используется `TELEGRAM_DEFAULT_CHAT_ID`) |
+| Поле            | Тип    | Обязательное | Описание                                                                   |
+| --------------- | ------ | ------------ | -------------------------------------------------------------------------- |
+| type            | string | да           | Тип события (например, `notification.created`)                             |
+| payload.message | string | да           | Текст уведомления                                                          |
+| payload.chatId  | string | нет          | Telegram chat ID (если не указан, используется `TELEGRAM_DEFAULT_CHAT_ID`) |
 
 ## Retry-механизм
 
 ```
-Ошибка обработки → nack → Dead Letter Exchange → Dead Letter Queue
-                                                          │
-                                           retry < MAX? ──┤
-                                              │           └── retry >= MAX → лог ошибки
-                                              ▼
-                                setTimeout(delay)
+Ошибка обработки → publishWithConfirm(retry queue) → ack original
                                       │
                                       ▼
-                            republish в main exchange
+                            TTL retry queue
                                       │
                                       ▼
-                              Consumer (повторная попытка)
+                       DLX обратно в main exchange
+
+Permanent / retry exhausted → publishWithConfirm(parking queue) → ack original
 ```
 
-- **Задержка**: экспоненциальная (`delay × 2^(retry-1)`)
+- **Задержка**: fixed TTL retry queue (`RETRY_DELAY_MS`)
 - **MAX_RETRY_ATTEMPTS**: 3 (по умолчанию)
-- **RETRY_DELAY_MS**: 2000ms (базовая задержка)
-- После исчерпания попыток сообщение логируется как permanently failed
-
-> **Ограничение текущей реализации**: задержка retry в DLQ реализована через `setTimeout` в consumer'е.
-> Это корректно работает для демо и единичного инстанса, но при рестарте consumer'а во время таймера
-> логика retry сбрасывается. Для production рекомендуется RabbitMQ Delayed Message Plugin
-> или TTL-based retry queues.
+- Любой перенос между очередями выполняется только после broker confirm
+- Если publish в retry/parking не подтвердился, оригинальное сообщение не ack'ается и requeue'ится
 
 ## Идемпотентность
 
 Идемпотентность реализована с атомарным lock'ом через Redis:
 
 1. **Проверка `processed:{eventId}`** — если запись существует, событие уже было обработано → ack
-2. **SET `processing:{eventId}` NX EX 60** — атомарный lock. Если не удался → другой consumer уже обрабатывает → ack
-3. **Отправка в Telegram** — если успешно → `SET processed:{eventId} EX 86400` + `DEL processing:{eventId}`
-4. **При ошибке Telegram** — `DEL processing:{eventId}` → throw → retry/DLQ
+2. **SET `processing:{eventId}` token NX EX 60** — атомарный lock. Если не удался → retryable error
+3. **Отправка в Telegram** — если успешно → `SET processed:{eventId} EX 86400` + token-checked lock release
+4. **При ошибке Telegram** — token-checked lock release → retry/parking flow
 
 Таким образом:
+
 - Уже обработанные события не обрабатываются повторно
 - При одновременной обработке двумя consumer'ами lock выигрывает только один
-- При падении consumer'а во время обработки lock истечёт через 60 секунд, и событие придёт снова через DLQ
+- При падении consumer'а во время обработки lock истечёт через 60 секунд, и событие придёт снова через RabbitMQ
 
 ## Обработка ошибок
 
-| Сценарий | Действие |
-|----------|----------|
-| Ошибка соединения с RabbitMQ (Producer) | Reconnect с exponential backoff (до 10 попыток) |
-| Ошибка соединения с RabbitMQ (Consumer) | Ошибка логируется, сервис падает (Docker restart) |
-| Ошибка Telegram API | Ошибка логируется, событие уходит в retry через DLQ |
-| Невалидное событие | Ошибка логируется, событие уходит в retry через DLQ |
-| Уже обработанный eventId (processed) | Событие подтверждается (ack), в лог пишется duplicate |
-| in-flight duplicate (processing lock занят) | Событие подтверждается (ack), в лог пишется in-flight |
-| Превышено число retry | Сообщение подтверждается, в лог пишется permanently failed |
-| TELEGRAM_BOT_TOKEN не задан | Consumer не стартует (fail-fast через config validation) |
-| Нет chatId в payload и default | Ошибка обработки события → retry через DLQ |
+| Сценарий                                    | Действие                                                 |
+| ------------------------------------------- | -------------------------------------------------------- |
+| Ошибка соединения с RabbitMQ (Producer)     | Reconnect с exponential backoff (до 10 попыток)          |
+| Ошибка соединения с RabbitMQ (Consumer)     | Reconnect с exponential backoff (до 10 попыток)          |
+| Retryable Telegram API/network error        | Publish в retry queue с confirm → ack original           |
+| Permanent Telegram/API/config error         | Publish в parking queue с confirm → ack original         |
+| Невалидное событие                          | Publish в parking queue с confirm → ack original         |
+| Уже обработанный eventId (processed)        | Событие подтверждается (ack), в лог пишется duplicate    |
+| in-flight duplicate (processing lock занят) | Retryable error → retry queue                            |
+| Превышено число retry                       | Publish в parking queue с confirm → ack original         |
+| TELEGRAM_BOT_TOKEN не задан                 | Consumer не стартует (fail-fast через config validation) |
+| Нет chatId в payload и default              | Permanent error → parking queue                          |
 
 ## Переменные окружения
 
-| Переменная | По умолчанию | Описание |
-|-----------|-------------|----------|
-| `RABBITMQ_URL` | `amqp://guest:guest@localhost:5672` | URL подключения к RabbitMQ |
-| `RABBITMQ_EXCHANGE` | `notifications.exchange` | Exchange |
-| `RABBITMQ_QUEUE` | `notifications.queue` | Основная очередь |
-| `RABBITMQ_ROUTING_KEY` | `notifications.created` | Routing key |
-| `RABBITMQ_DLX` | `notifications.dlx` | Dead Letter Exchange |
-| `RABBITMQ_DLQ` | `notifications.dlq` | Dead Letter Queue |
-| `TELEGRAM_BOT_TOKEN` | **обязательный** | Токен Telegram бота (fail-fast при отсутствии) |
-| `TELEGRAM_DEFAULT_CHAT_ID` | — | Chat ID по умолчанию (если не указан в payload события) |
-| `REDIS_URL` | `redis://localhost:6379` | URL подключения к Redis |
-| `MAX_RETRY_ATTEMPTS` | `3` | Максимум retry попыток |
-| `RETRY_DELAY_MS` | `2000` | Базовая задержка retry (ms) |
-| `PRODUCER_PORT` | `3000` | Порт HTTP API Producer |
+| Переменная                     | По умолчанию                        | Описание                                                |
+| ------------------------------ | ----------------------------------- | ------------------------------------------------------- |
+| `RABBITMQ_URL`                 | `amqp://guest:guest@localhost:5672` | URL подключения к RabbitMQ                              |
+| `RABBITMQ_EXCHANGE`            | `notifications.exchange`            | Exchange                                                |
+| `RABBITMQ_QUEUE`               | `notifications.queue`               | Основная очередь                                        |
+| `RABBITMQ_ROUTING_KEY`         | `notifications.created`             | Routing key                                             |
+| `RABBITMQ_RETRY_EXCHANGE`      | `notifications.retry.exchange`      | Exchange для retry-сообщений                            |
+| `RABBITMQ_RETRY_QUEUE`         | `notifications.retry.queue`         | TTL retry queue                                         |
+| `RABBITMQ_RETRY_ROUTING_KEY`   | `notifications.retry`               | Routing key retry queue                                 |
+| `RABBITMQ_PARKING_EXCHANGE`    | `notifications.parking.exchange`    | Exchange для permanent failures                         |
+| `RABBITMQ_PARKING_QUEUE`       | `notifications.parking.queue`       | Parking queue                                           |
+| `RABBITMQ_PARKING_ROUTING_KEY` | `notifications.parking`             | Routing key parking queue                               |
+| `RABBITMQ_CONFIRM_TIMEOUT_MS`  | `5000`                              | Таймаут ожидания broker confirm                         |
+| `TELEGRAM_BOT_TOKEN`           | **обязательный**                    | Токен Telegram бота (fail-fast при отсутствии)          |
+| `TELEGRAM_DEFAULT_CHAT_ID`     | —                                   | Chat ID по умолчанию (если не указан в payload события) |
+| `TELEGRAM_REQUEST_TIMEOUT_MS`  | `5000`                              | Таймаут запроса к Telegram API                          |
+| `REDIS_URL`                    | `redis://localhost:6379`            | URL подключения к Redis                                 |
+| `MAX_RETRY_ATTEMPTS`           | `3`                                 | Максимум retry попыток                                  |
+| `RETRY_DELAY_MS`               | `2000`                              | Базовая задержка retry (ms)                             |
+| `PRODUCER_PORT`                | `3000`                              | Порт HTTP API Producer                                  |
 
 ## Тестирование
 
@@ -230,7 +239,7 @@ fin_decisions/
 │       ├── src/
 │       │   ├── config/     # Конфигурация (env validation)
 │       │   ├── consumer/   # Обработчик событий
-│       │   ├── rabbitmq/   # RabbitMQ consumer + DLQ
+│       │   ├── rabbitmq/   # RabbitMQ consumer + retry/parking queues
 │       │   ├── redis/      # Redis client (idempotency)
 │       │   └── telegram/   # Telegram Bot API client
 │       └── Dockerfile

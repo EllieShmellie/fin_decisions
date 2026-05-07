@@ -1,9 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { AppConfigService } from '../config/config.service';
 import { NotificationEvent } from '@fin/shared';
+import { PermanentProcessingError, RetryableProcessingError } from '../consumer/processing.errors';
+import { NotificationSender } from '../consumer/consumer.ports';
 
 @Injectable()
-export class TelegramService {
+export class TelegramService implements NotificationSender {
   private readonly logger = new Logger(TelegramService.name);
   private readonly botToken: string;
   private readonly defaultChatId: string | undefined;
@@ -19,31 +21,45 @@ export class TelegramService {
     const chatId = event.payload.chatId || this.defaultChatId;
 
     if (!chatId) {
-      throw new Error(
+      throw new PermanentProcessingError(
         'No chatId provided in event payload and TELEGRAM_DEFAULT_CHAT_ID is not set',
       );
     }
 
     const message = this.formatMessage(event);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.telegramRequestTimeoutMs);
 
-    const response = await fetch(`${this.apiBase}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: message,
-        parse_mode: 'HTML',
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.apiBase}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message,
+          parse_mode: 'HTML',
+        }),
+      });
+    } catch (error) {
+      throw new RetryableProcessingError('Telegram request failed', error);
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (!response.ok) {
       const errorBody = await response.text();
-      throw new Error(`Telegram API error: ${response.status} ${errorBody}`);
+      const message = `Telegram API error: ${response.status} ${errorBody}`;
+
+      if (response.status === 429 || response.status >= 500) {
+        throw new RetryableProcessingError(message);
+      }
+
+      throw new PermanentProcessingError(message);
     }
 
-    this.logger.log(
-      `Telegram notification sent to chatId=${chatId} for event=${event.eventId}`,
-    );
+    this.logger.log(`Telegram notification sent to chatId=${chatId} for event=${event.eventId}`);
   }
 
   private formatMessage(event: NotificationEvent): string {
@@ -57,9 +73,6 @@ export class TelegramService {
   }
 
   private escapeHtml(text: string): string {
-    return text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 }

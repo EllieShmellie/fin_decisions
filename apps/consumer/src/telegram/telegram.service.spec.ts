@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { TelegramService } from './telegram.service';
 import { AppConfigService } from '../config/config.service';
+import { PermanentProcessingError, RetryableProcessingError } from '../consumer/processing.errors';
 
 describe('TelegramService', () => {
   const createEvent = (overrides?: Record<string, unknown>) => ({
@@ -23,6 +24,7 @@ describe('TelegramService', () => {
             useValue: {
               telegramBotToken: 'test-token',
               telegramDefaultChatId: 'default-chat',
+              telegramRequestTimeoutMs: 5000,
             },
           },
         ],
@@ -32,9 +34,7 @@ describe('TelegramService', () => {
       await service.sendNotification(createEvent());
 
       const callArgs = (global.fetch as jest.Mock).mock.calls[0];
-      expect(callArgs[0]).toBe(
-        'https://api.telegram.org/bottest-token/sendMessage',
-      );
+      expect(callArgs[0]).toBe('https://api.telegram.org/bottest-token/sendMessage');
       const body = JSON.parse(callArgs[1].body);
       expect(body.chat_id).toBe('123');
       expect(body.parse_mode).toBe('HTML');
@@ -51,6 +51,7 @@ describe('TelegramService', () => {
             useValue: {
               telegramBotToken: 'test-token',
               telegramDefaultChatId: 'default-chat',
+              telegramRequestTimeoutMs: 5000,
             },
           },
         ],
@@ -73,6 +74,7 @@ describe('TelegramService', () => {
             useValue: {
               telegramBotToken: 'test-token',
               telegramDefaultChatId: undefined,
+              telegramRequestTimeoutMs: 5000,
             },
           },
         ],
@@ -81,13 +83,11 @@ describe('TelegramService', () => {
       const service = module.get<TelegramService>(TelegramService);
 
       await expect(
-        service.sendNotification(
-          createEvent({ payload: { message: 'test' } }),
-        ),
-      ).rejects.toThrow('No chatId provided');
+        service.sendNotification(createEvent({ payload: { message: 'test' } })),
+      ).rejects.toThrow(PermanentProcessingError);
     });
 
-    it('should throw on Telegram API error', async () => {
+    it('should throw permanent error on Telegram 403', async () => {
       global.fetch = jest.fn().mockResolvedValue({
         ok: false,
         status: 403,
@@ -102,6 +102,7 @@ describe('TelegramService', () => {
             useValue: {
               telegramBotToken: 'test-token',
               telegramDefaultChatId: 'chat',
+              telegramRequestTimeoutMs: 5000,
             },
           },
         ],
@@ -109,9 +110,93 @@ describe('TelegramService', () => {
 
       const service = module.get<TelegramService>(TelegramService);
 
-      await expect(
-        service.sendNotification(createEvent()),
-      ).rejects.toThrow('Telegram API error: 403');
+      await expect(service.sendNotification(createEvent())).rejects.toThrow(
+        PermanentProcessingError,
+      );
+    });
+
+    it('should throw retryable error on Telegram 5xx', async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        text: jest.fn().mockResolvedValue('Bad Gateway'),
+      });
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          TelegramService,
+          {
+            provide: AppConfigService,
+            useValue: {
+              telegramBotToken: 'test-token',
+              telegramDefaultChatId: 'chat',
+              telegramRequestTimeoutMs: 5000,
+            },
+          },
+        ],
+      }).compile();
+
+      const service = module.get<TelegramService>(TelegramService);
+
+      await expect(service.sendNotification(createEvent())).rejects.toThrow(
+        RetryableProcessingError,
+      );
+    });
+
+    it('should throw retryable error on network failure', async () => {
+      global.fetch = jest.fn().mockRejectedValue(new Error('network down'));
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          TelegramService,
+          {
+            provide: AppConfigService,
+            useValue: {
+              telegramBotToken: 'test-token',
+              telegramDefaultChatId: 'chat',
+              telegramRequestTimeoutMs: 5000,
+            },
+          },
+        ],
+      }).compile();
+
+      const service = module.get<TelegramService>(TelegramService);
+
+      await expect(service.sendNotification(createEvent())).rejects.toThrow(
+        RetryableProcessingError,
+      );
+    });
+
+    it('should throw retryable error on timeout', async () => {
+      jest.useFakeTimers();
+      global.fetch = jest.fn((_url, init?: RequestInit) => {
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(new Error('aborted'));
+          });
+        });
+      }) as jest.Mock;
+
+      const module: TestingModule = await Test.createTestingModule({
+        providers: [
+          TelegramService,
+          {
+            provide: AppConfigService,
+            useValue: {
+              telegramBotToken: 'test-token',
+              telegramDefaultChatId: 'chat',
+              telegramRequestTimeoutMs: 100,
+            },
+          },
+        ],
+      }).compile();
+
+      const service = module.get<TelegramService>(TelegramService);
+      const sendPromise = service.sendNotification(createEvent());
+      jest.advanceTimersByTime(100);
+
+      await expect(sendPromise).rejects.toThrow(RetryableProcessingError);
+      jest.useRealTimers();
     });
   });
 
@@ -125,6 +210,7 @@ describe('TelegramService', () => {
             useValue: {
               telegramBotToken: 'test-token',
               telegramDefaultChatId: 'chat',
+              telegramRequestTimeoutMs: 5000,
             },
           },
         ],
@@ -150,6 +236,7 @@ describe('TelegramService', () => {
             useValue: {
               telegramBotToken: 'test-token',
               telegramDefaultChatId: 'chat',
+              telegramRequestTimeoutMs: 5000,
             },
           },
         ],

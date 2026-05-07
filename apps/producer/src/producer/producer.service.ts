@@ -10,7 +10,9 @@ export class ProducerService {
 
   constructor(private readonly rabbitmqService: RabbitmqService) {}
 
-  async sendEvent(dto: CreateEventDto): Promise<{ success: boolean; eventId: string; message: string }> {
+  async sendEvent(
+    dto: CreateEventDto,
+  ): Promise<{ success: boolean; eventId: string; message: string }> {
     const event: NotificationEvent = {
       eventId: uuidv4(),
       type: dto.type,

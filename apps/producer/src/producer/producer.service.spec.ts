@@ -12,10 +12,7 @@ describe('ProducerService', () => {
     };
 
     const module: TestingModule = await Test.createTestingModule({
-      providers: [
-        ProducerService,
-        { provide: RabbitmqService, useValue: mockRabbitmq },
-      ],
+      providers: [ProducerService, { provide: RabbitmqService, useValue: mockRabbitmq }],
     }).compile();
 
     service = module.get<ProducerService>(ProducerService);
@@ -54,9 +51,7 @@ describe('ProducerService', () => {
         payload: { message: 'Test' },
       };
 
-      await expect(service.sendEvent(dto)).rejects.toThrow(
-        'Message was not confirmed by RabbitMQ',
-      );
+      await expect(service.sendEvent(dto)).rejects.toThrow('Message was not confirmed by RabbitMQ');
     });
 
     it('should include createdAt and eventId in event', async () => {

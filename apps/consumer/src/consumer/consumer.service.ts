@@ -1,42 +1,52 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { RedisService } from '../redis/redis.service';
-import { TelegramService } from '../telegram/telegram.service';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { NotificationEvent } from '@fin/shared';
+import {
+  IDEMPOTENCY_STORE,
+  IdempotencyStore,
+  NOTIFICATION_SENDER,
+  NotificationSender,
+} from './consumer.ports';
+import { PermanentProcessingError, RetryableProcessingError } from './processing.errors';
 
 @Injectable()
 export class ConsumerService {
   private readonly logger = new Logger(ConsumerService.name);
 
   constructor(
-    private readonly redisService: RedisService,
-    private readonly telegramService: TelegramService,
+    @Inject(IDEMPOTENCY_STORE)
+    private readonly idempotencyStore: IdempotencyStore,
+    @Inject(NOTIFICATION_SENDER)
+    private readonly notificationSender: NotificationSender,
   ) {}
 
   async processEvent(event: NotificationEvent): Promise<void> {
     if (!event.eventId || !event.type || !event.payload) {
-      throw new Error('Invalid event structure: missing required fields');
+      throw new PermanentProcessingError('Invalid event structure: missing required fields');
     }
 
-    if (await this.redisService.isProcessed(event.eventId)) {
+    if (await this.idempotencyStore.isProcessed(event.eventId)) {
       this.logger.log(`Already processed: eventId=${event.eventId}. Skipping.`);
       return;
     }
 
-    const lockAcquired = await this.redisService.tryAcquireLock(event.eventId);
-    if (!lockAcquired) {
-      this.logger.log(`In-flight duplicate: eventId=${event.eventId}. Another consumer is processing.`);
-      throw new Error('In-flight duplicate: event is being processed by another consumer');
+    const lockToken = await this.idempotencyStore.tryAcquireLock(event.eventId);
+    if (!lockToken) {
+      this.logger.log(
+        `In-flight duplicate: eventId=${event.eventId}. Another consumer is processing.`,
+      );
+      throw new RetryableProcessingError(
+        'In-flight duplicate: event is being processed by another consumer',
+      );
     }
 
     this.logger.log(`Processing event: eventId=${event.eventId} type=${event.type}`);
 
     try {
-      await this.telegramService.sendNotification(event);
-      await this.redisService.markProcessed(event.eventId);
-      await this.redisService.releaseLock(event.eventId);
+      await this.notificationSender.sendNotification(event);
+      await this.idempotencyStore.completeProcessing(event.eventId, lockToken);
       this.logger.log(`Event processed and marked as completed: eventId=${event.eventId}`);
     } catch (error) {
-      await this.redisService.releaseLock(event.eventId);
+      await this.idempotencyStore.releaseLock(event.eventId, lockToken);
       this.logger.error(
         `Failed to process event: eventId=${event.eventId}`,
         error instanceof Error ? error.message : error,

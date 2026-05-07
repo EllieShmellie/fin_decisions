@@ -1,8 +1,15 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
-import { connect, Channel, ConsumeMessage } from 'amqplib';
+import { connect, Channel, ConfirmChannel, ConsumeMessage, Options } from 'amqplib';
 import type { ChannelModel } from 'amqplib';
 import { AppConfigService } from '../config/config.service';
 import { ConsumerService } from '../consumer/consumer.service';
+import {
+  isPermanentProcessingError,
+  PermanentProcessingError,
+} from '../consumer/processing.errors';
+import { NotificationEvent } from '@fin/shared';
+
+type MessageHeaders = Record<string, unknown>;
 
 @Injectable()
 export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
@@ -64,6 +71,11 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   }
 
   private scheduleReconnect(): void {
+    if (this.reconnectTimer) {
+      this.logger.log('Reconnect already scheduled');
+      return;
+    }
+
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.logger.error(
         `Max reconnect attempts (${this.maxReconnectAttempts}) reached. Giving up.`,
@@ -77,7 +89,10 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       `Scheduling reconnect in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
     );
 
-    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect();
+    }, delay);
   }
 
   private clearReconnectTimer(): void {
@@ -94,14 +109,16 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       durable: true,
     });
 
-    await this.channel.assertExchange(this.config.rabbitmqDlx, 'direct', {
+    await this.channel.assertExchange(this.config.rabbitmqRetryExchange, 'direct', {
+      durable: true,
+    });
+
+    await this.channel.assertExchange(this.config.rabbitmqParkingExchange, 'direct', {
       durable: true,
     });
 
     const queue = await this.channel.assertQueue(this.config.rabbitmqQueue, {
       durable: true,
-      deadLetterExchange: this.config.rabbitmqDlx,
-      deadLetterRoutingKey: this.config.rabbitmqRoutingKey,
     });
 
     await this.channel.bindQueue(
@@ -110,46 +127,51 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       this.config.rabbitmqRoutingKey,
     );
 
-    const dlq = await this.channel.assertQueue(this.config.rabbitmqDlq, {
+    const retryQueue = await this.channel.assertQueue(this.config.rabbitmqRetryQueue, {
+      durable: true,
+      messageTtl: this.config.retryDelayMs,
+      deadLetterExchange: this.config.rabbitmqExchange,
+      deadLetterRoutingKey: this.config.rabbitmqRoutingKey,
+    });
+
+    await this.channel.bindQueue(
+      retryQueue.queue,
+      this.config.rabbitmqRetryExchange,
+      this.config.rabbitmqRetryRoutingKey,
+    );
+
+    const parkingQueue = await this.channel.assertQueue(this.config.rabbitmqParkingQueue, {
       durable: true,
     });
 
     await this.channel.bindQueue(
-      dlq.queue,
-      this.config.rabbitmqDlx,
-      this.config.rabbitmqRoutingKey,
+      parkingQueue.queue,
+      this.config.rabbitmqParkingExchange,
+      this.config.rabbitmqParkingRoutingKey,
     );
 
     this.logger.log(
-      `RabbitMQ infrastructure set up: exchange=${this.config.rabbitmqExchange} queue=${this.config.rabbitmqQueue}`,
+      `RabbitMQ infrastructure set up: exchange=${this.config.rabbitmqExchange} queue=${this.config.rabbitmqQueue} retryQueue=${this.config.rabbitmqRetryQueue} parkingQueue=${this.config.rabbitmqParkingQueue}`,
     );
   }
 
   private async startConsuming(): Promise<void> {
     if (!this.channel) throw new Error('Channel not initialized');
 
-    await this.channel.consume(
-      this.config.rabbitmqQueue,
-      (msg) => this.handleMessage(msg),
-      { noAck: false },
-    );
+    await this.channel.consume(this.config.rabbitmqQueue, (msg) => this.handleMessage(msg), {
+      noAck: false,
+    });
 
-    await this.channel.consume(
-      this.config.rabbitmqDlq,
-      (msg) => this.handleDlqMessage(msg),
-      { noAck: false },
-    );
-
-    this.logger.log('Started consuming messages from main and DLQ');
+    this.logger.log('Started consuming messages from main queue');
   }
 
   private async handleMessage(msg: ConsumeMessage | null): Promise<void> {
     if (!msg || !this.channel) return;
 
-    const retryCount = msg.properties.headers?.['x-retry-count'] || 0;
+    const retryCount = this.getRetryCount(msg);
 
     try {
-      const content = JSON.parse(msg.content.toString());
+      const content = this.parseEvent(msg);
 
       this.logger.log(
         `Received event: eventId=${content.eventId} type=${content.type} retry=${retryCount}`,
@@ -164,59 +186,120 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
         `Failed to process event: ${error instanceof Error ? error.message : 'Unknown error'}`,
       );
 
-      if (retryCount < this.config.maxRetryAttempts) {
-        this.channel.nack(msg, false, false);
-        this.logger.log(`Event sent to DLQ for retry: retry=${retryCount + 1}`);
-      } else {
-        this.channel.ack(msg);
-        this.logger.error(
-          `Event permanently failed after ${retryCount} retry attempts`,
-        );
+      if (isPermanentProcessingError(error) || retryCount >= this.config.maxRetryAttempts) {
+        await this.transferToParkingThenAck(msg, retryCount, error);
+        return;
       }
+
+      await this.transferToRetryThenAck(msg, retryCount + 1);
     }
   }
 
-  private async handleDlqMessage(msg: ConsumeMessage | null): Promise<void> {
-    if (!msg || !this.channel) return;
+  private parseEvent(msg: ConsumeMessage): NotificationEvent {
+    try {
+      const content = JSON.parse(msg.content.toString()) as Partial<NotificationEvent>;
 
-    const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
+      if (
+        !content.eventId ||
+        !content.type ||
+        !content.payload ||
+        typeof content.payload.message !== 'string'
+      ) {
+        throw new PermanentProcessingError('Invalid event structure: missing required fields');
+      }
 
-    if (retryCount > this.config.maxRetryAttempts) {
-      this.logger.warn(
-        `Retry exhausted for DLQ message, parking permanently (retry=${retryCount})`,
-      );
-      this.channel.ack(msg);
-      return;
+      return content as NotificationEvent;
+    } catch (error) {
+      if (isPermanentProcessingError(error)) {
+        throw error;
+      }
+      throw new PermanentProcessingError('Invalid event JSON', error);
     }
+  }
 
-    const delay = this.config.retryDelayMs * Math.pow(2, retryCount - 1);
+  private async transferToRetryThenAck(msg: ConsumeMessage, retryCount: number): Promise<void> {
+    if (!this.channel) return;
 
     try {
-      await new Promise<void>((resolve) => setTimeout(resolve, delay));
       await this.publishWithConfirm(
-        this.config.rabbitmqExchange,
-        this.config.rabbitmqRoutingKey,
+        this.config.rabbitmqRetryExchange,
+        this.config.rabbitmqRetryRoutingKey,
         msg.content,
-        {
-          headers: { 'x-retry-count': retryCount },
-          persistent: true,
-        },
+        this.buildPublishOptions(msg, {
+          ...this.getHeaders(msg),
+          'x-retry-count': retryCount,
+        }),
       );
+
       this.channel.ack(msg);
-      this.logger.log(`Message re-published for retry ${retryCount}`);
-    } catch (error) {
+      this.logger.log(`Event moved to retry queue: retry=${retryCount}`);
+    } catch (publishError) {
       this.logger.error(
-        `Failed to re-publish message from DLQ: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        `Failed to move event to retry queue: ${publishError instanceof Error ? publishError.message : 'Unknown error'}`,
       );
       this.channel.nack(msg, false, true);
     }
+  }
+
+  private async transferToParkingThenAck(
+    msg: ConsumeMessage,
+    retryCount: number,
+    error: unknown,
+  ): Promise<void> {
+    if (!this.channel) return;
+
+    try {
+      await this.publishWithConfirm(
+        this.config.rabbitmqParkingExchange,
+        this.config.rabbitmqParkingRoutingKey,
+        msg.content,
+        this.buildPublishOptions(msg, {
+          ...this.getHeaders(msg),
+          'x-retry-count': retryCount,
+          'x-parking-reason': error instanceof Error ? error.message : 'Unknown error',
+        }),
+      );
+
+      this.channel.ack(msg);
+      this.logger.error(`Event parked permanently after ${retryCount} retries`);
+    } catch (publishError) {
+      this.logger.error(
+        `Failed to move event to parking queue: ${publishError instanceof Error ? publishError.message : 'Unknown error'}`,
+      );
+      this.channel.nack(msg, false, true);
+    }
+  }
+
+  private getHeaders(msg: ConsumeMessage): MessageHeaders {
+    return { ...(msg.properties.headers ?? {}) };
+  }
+
+  private getRetryCount(msg: ConsumeMessage): number {
+    const retryCount = msg.properties.headers?.['x-retry-count'];
+    return typeof retryCount === 'number' ? retryCount : Number(retryCount) || 0;
+  }
+
+  private buildPublishOptions(msg: ConsumeMessage, headers: MessageHeaders): Options.Publish {
+    return {
+      persistent: true,
+      contentType: msg.properties.contentType,
+      contentEncoding: msg.properties.contentEncoding,
+      correlationId: msg.properties.correlationId,
+      replyTo: msg.properties.replyTo,
+      messageId: msg.properties.messageId,
+      timestamp: msg.properties.timestamp,
+      type: msg.properties.type,
+      userId: msg.properties.userId,
+      appId: msg.properties.appId,
+      headers,
+    };
   }
 
   private async publishWithConfirm(
     exchange: string,
     routingKey: string,
     content: Buffer,
-    options?: object,
+    options?: Options.Publish,
   ): Promise<void> {
     if (!this.connection) throw new Error('RMQ connection not available');
 
@@ -225,14 +308,36 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       const published = confirmChannel.publish(exchange, routingKey, content, options);
 
       if (!published) {
-        await new Promise<void>((resolve) =>
-          confirmChannel.once('drain', resolve),
-        );
+        await new Promise<void>((resolve) => confirmChannel.once('drain', resolve));
       }
 
-      await confirmChannel.waitForConfirms();
+      await this.waitForConfirmOrTimeout(confirmChannel);
     } finally {
-      await confirmChannel.close();
+      try {
+        await confirmChannel.close();
+      } catch (error) {
+        this.logger.warn(
+          `Failed to close confirm channel: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        );
+      }
+    }
+  }
+
+  private async waitForConfirmOrTimeout(channel: ConfirmChannel): Promise<void> {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+
+    try {
+      await Promise.race([
+        channel.waitForConfirms(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error('RabbitMQ confirm timeout')),
+            this.config.rabbitmqConfirmTimeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }
 

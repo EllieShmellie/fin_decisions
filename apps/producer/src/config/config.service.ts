@@ -28,4 +28,8 @@ export class AppConfigService {
   get port(): number {
     return this.configService.get<number>('PRODUCER_PORT', 3000);
   }
+
+  get rabbitmqConfirmTimeoutMs(): number {
+    return this.configService.get<number>('RABBITMQ_CONFIRM_TIMEOUT_MS', 5000);
+  }
 }
