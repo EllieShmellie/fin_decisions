@@ -45,8 +45,6 @@ docker compose up --build
 - Swagger: http://localhost:3000/api
 - RabbitMQ Management: http://localhost:15672 (`guest` / `guest`)
 
-Consumer отдельного HTTP-интерфейса не имеет, он слушает очередь RabbitMQ.
-
 ## Проверка вручную
 
 Через Swagger откройте `POST /events`, либо отправьте запрос:
@@ -71,8 +69,6 @@ curl -X POST http://localhost:3000/events \
   "message": "Event successfully sent"
 }
 ```
-
-Если `payload.chatId` не передан, Consumer использует `TELEGRAM_DEFAULT_CHAT_ID`.
 
 ## Надежность обработки
 
