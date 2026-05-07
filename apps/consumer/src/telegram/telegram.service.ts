@@ -14,7 +14,8 @@ export class TelegramService implements NotificationSender {
   constructor(private readonly config: AppConfigService) {
     this.botToken = config.telegramBotToken;
     this.defaultChatId = config.telegramDefaultChatId;
-    this.apiBase = `https://api.telegram.org/bot${this.botToken}`;
+    const apiBaseUrl = (config.telegramApiBaseUrl || 'https://api.telegram.org').replace(/\/+$/, '');
+    this.apiBase = `${apiBaseUrl}/bot${this.botToken}`;
   }
 
   async sendNotification(event: NotificationEvent): Promise<void> {

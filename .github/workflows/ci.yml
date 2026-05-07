@@ -45,12 +45,17 @@ jobs:
         run: npm run test:e2e
 
   docker:
-    name: Docker build
+    name: Docker integration smoke test
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build service images
-        run: docker compose build producer consumer
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Integration smoke test
+        run: npm run test:integration

@@ -16,8 +16,6 @@ services:
   redis:
     image: redis:7-alpine
     container_name: fin-redis
-    ports:
-      - '6379:6379'
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 10s
@@ -67,6 +65,7 @@ services:
       REDIS_URL: redis://redis:6379
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_DEFAULT_CHAT_ID: ${TELEGRAM_DEFAULT_CHAT_ID:-}
+      TELEGRAM_API_BASE_URL: ${TELEGRAM_API_BASE_URL:-https://api.telegram.org}
       TELEGRAM_REQUEST_TIMEOUT_MS: 5000
       MAX_RETRY_ATTEMPTS: 3
       RETRY_DELAY_MS: 2000

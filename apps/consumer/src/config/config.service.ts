@@ -29,6 +29,10 @@ export class AppConfigService {
     return this.configService.get<string>('TELEGRAM_DEFAULT_CHAT_ID');
   }
 
+  get telegramApiBaseUrl(): string {
+    return this.configService.get<string>('TELEGRAM_API_BASE_URL', 'https://api.telegram.org');
+  }
+
   get redisUrl(): string {
     return this.configService.get<string>('REDIS_URL', 'redis://localhost:6379');
   }

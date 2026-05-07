@@ -14,6 +14,7 @@ export const validationSchema = Joi.object({
   RABBITMQ_CONFIRM_TIMEOUT_MS: Joi.number().default(5000),
   TELEGRAM_BOT_TOKEN: Joi.string().min(1).required(),
   TELEGRAM_DEFAULT_CHAT_ID: Joi.string().optional(),
+  TELEGRAM_API_BASE_URL: Joi.string().uri().default('https://api.telegram.org'),
   TELEGRAM_REQUEST_TIMEOUT_MS: Joi.number().default(5000),
   REDIS_URL: Joi.string().default('redis://localhost:6379'),
   MAX_RETRY_ATTEMPTS: Joi.number().default(3),

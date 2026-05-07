@@ -7,6 +7,7 @@
     "dev:consumer": "npm run start:dev -w apps/consumer",
     "test": "npm run test --workspaces --if-present",
     "test:e2e": "npm run test:e2e -w apps/producer",
+    "test:integration": "bash test/integration/run.sh",
     "lint": "eslint .",
     "format": "prettier --write \"apps/**/*.ts\" \"shared/**/*.ts\""
   },

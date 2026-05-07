@@ -1,0 +1,37 @@
+services:
+  mock-telegram:
+    image: node:20-alpine
+    command: ['node', '/app/mock-telegram.js']
+    ports:
+      - '18080:8080'
+    volumes:
+      - ./test/integration/mock-telegram.js:/app/mock-telegram.js:ro
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://localhost:8080/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks:
+      - fin-network
+
+  consumer:
+    environment:
+      TELEGRAM_BOT_TOKEN: integration-test-token
+      TELEGRAM_DEFAULT_CHAT_ID: '123456789'
+      TELEGRAM_API_BASE_URL: http://mock-telegram:8080
+      TELEGRAM_REQUEST_TIMEOUT_MS: 2000
+      MAX_RETRY_ATTEMPTS: 2
+      RETRY_DELAY_MS: 500
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mock-telegram:
+        condition: service_healthy

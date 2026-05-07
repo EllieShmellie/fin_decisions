@@ -131,6 +131,7 @@ publishWithConfirm(target queue) -> ack original message
 - `RABBITMQ_CONFIRM_TIMEOUT_MS`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_DEFAULT_CHAT_ID`
+- `TELEGRAM_API_BASE_URL`
 - `TELEGRAM_REQUEST_TIMEOUT_MS`
 - `REDIS_URL`
 - `MAX_RETRY_ATTEMPTS`
@@ -155,9 +156,10 @@ npm run lint
 npm run build
 npm test
 npm run test:e2e
+npm run test:integration
 ```
 
-В CI дополнительно выполняется Docker build обоих сервисов.
+Интеграционный тест поднимает Docker Compose стек, отправляет событие через Producer и проверяет доставку в mock Telegram API.
 
 ## Структура проекта
 

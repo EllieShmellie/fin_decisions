@@ -14,6 +14,6 @@ module.exports = tseslint.config(
     },
   },
   {
-    ignores: ['**/dist/**', '**/node_modules/**', '*.js', '*.json'],
+    ignores: ['**/dist/**', '**/node_modules/**', '*.js', '*.json', 'test/integration/*.js'],
   },
 );
