@@ -1,101 +1,55 @@
-# Fin Decisions — Notification System
+# Fin Decisions Notification System
 
-Микросервисная система уведомлений на Nest.js, RabbitMQ и Telegram API.
+Микросервисная система уведомлений на Nest.js: Producer принимает HTTP-события, публикует их в RabbitMQ, Consumer обрабатывает сообщения и отправляет уведомления в Telegram.
 
-## Архитектура
+## Что внутри
 
-```
-┌─────────────┐     ┌──────────┐     ┌─────────────┐     ┌──────────┐
-│  Producer    │────▶│ RabbitMQ │────▶│  Consumer    │────▶│ Telegram │
-│  (HTTP API)  │     │  Broker  │     │  (Processor) │     │  Bot API │
-└─────────────┘     └──────────┘     └──────┬───────┘     └──────────┘
-                                            │
-                                            ▼
-                                       ┌──────────┐
-                                       │   Redis   │
-                                       │(idempotent)│
-                                       └──────────┘
+```text
+Producer HTTP API -> RabbitMQ -> Consumer -> Telegram Bot API
+                                      |
+                                      v
+                                    Redis
+                              idempotency state
 ```
 
-### Компоненты
+- `apps/producer` — HTTP API для создания событий и публикации в RabbitMQ.
+- `apps/consumer` — обработчик RabbitMQ-сообщений и отправка Telegram-уведомлений.
+- `shared` — общие типы событий.
+- `RabbitMQ` — основной broker, retry queue и parking queue.
+- `Redis` — idempotency lock и marker обработанных событий.
 
-| Сервис       | Назначение                                               | Порт |
-| ------------ | -------------------------------------------------------- | ---- |
-| **Producer** | HTTP API для отправки событий в RabbitMQ                 | 3000 |
-| **Consumer** | Получение событий из RMQ, обработка, отправка в Telegram | —    |
-| **RabbitMQ** | Брокер сообщений, TTL retry queue и parking queue        | 5672 |
-| **Redis**    | Хранение обработанных eventId (идемпотентность)          | 6379 |
-
-## Быстрый старт
-
-### 1. Клонирование и настройка
+## Быстрый запуск
 
 ```bash
-git clone <url>
+git clone <repo-url>
 cd fin_decisions
 cp .env.example .env
 ```
 
-### 2. Настройка переменных окружения
-
-Отредактируйте `.env`:
+Заполните в `.env` Telegram-настройки:
 
 ```env
-# RabbitMQ
-RABBITMQ_URL=amqp://guest:guest@localhost:5672
-RABBITMQ_EXCHANGE=notifications.exchange
-RABBITMQ_QUEUE=notifications.queue
-RABBITMQ_ROUTING_KEY=notifications.created
-RABBITMQ_RETRY_EXCHANGE=notifications.retry.exchange
-RABBITMQ_RETRY_QUEUE=notifications.retry.queue
-RABBITMQ_RETRY_ROUTING_KEY=notifications.retry
-RABBITMQ_PARKING_EXCHANGE=notifications.parking.exchange
-RABBITMQ_PARKING_QUEUE=notifications.parking.queue
-RABBITMQ_PARKING_ROUTING_KEY=notifications.parking
-RABBITMQ_CONFIRM_TIMEOUT_MS=5000
-
-# Telegram (обязательно для отправки)
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_DEFAULT_CHAT_ID=your_chat_id_here
-TELEGRAM_REQUEST_TIMEOUT_MS=5000
-
-# Redis
-REDIS_URL=redis://localhost:6379
-
-# Retry
-MAX_RETRY_ATTEMPTS=3
-RETRY_DELAY_MS=2000
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_DEFAULT_CHAT_ID=your_chat_id
 ```
 
-### 3. Запуск через Docker Compose
+Затем запустите сервисы:
 
 ```bash
 docker compose up --build
 ```
 
-Сервисы, которые запустятся:
+Доступные адреса:
 
-- **Producer** — http://localhost:3000
-- **RabbitMQ Management** — http://localhost:15672 (guest/guest)
-- **Redis**
+- Producer API: http://localhost:3000
+- Swagger: http://localhost:3000/api
+- RabbitMQ Management: http://localhost:15672 (`guest` / `guest`)
 
-### 4. Локальный запуск (без Docker)
+Consumer отдельного HTTP-интерфейса не имеет, он слушает очередь RabbitMQ.
 
-```bash
-# Установка зависимостей
-npm install
+## Проверка вручную
 
-# Сборка shared
-npm run build -w shared
-
-# Терминал 1: Producer
-npm run dev:producer
-
-# Терминал 2: Consumer
-npm run dev:consumer
-```
-
-### 5. Отправка тестового события
+Через Swagger откройте `POST /events`, либо отправьте запрос:
 
 ```bash
 curl -X POST http://localhost:3000/events \
@@ -103,8 +57,7 @@ curl -X POST http://localhost:3000/events \
   -d '{
     "type": "notification.created",
     "payload": {
-      "message": "Hello from Nest.js",
-      "chatId": "123456789"
+      "message": "Hello from Fin Decisions"
     }
   }'
 ```
@@ -119,142 +72,126 @@ curl -X POST http://localhost:3000/events \
 }
 ```
 
+Если `payload.chatId` не передан, Consumer использует `TELEGRAM_DEFAULT_CHAT_ID`.
+
+## Надежность обработки
+
+Producer публикует сообщения через RabbitMQ confirm channel и не считает `channel.publish()` подтверждением доставки. Consumer также переносит сообщения между очередями только по правилу:
+
+```text
+publishWithConfirm(target queue) -> ack original message
+```
+
+Если publish в retry или parking queue не подтвердился, исходное сообщение не ack'ается и возвращается в очередь.
+
+Что реализовано:
+
+- durable exchanges/queues;
+- JSON-сериализация событий;
+- уникальный `eventId`;
+- broker confirms для Producer и Consumer transfer flow;
+- confirm timeout и пересоздание channel при неясном состоянии;
+- fixed TTL retry queue с DLX обратно в main exchange;
+- parking queue для permanent failures и исчерпанных retry;
+- сохранение headers при republish, включая `x-retry-count`;
+- Redis idempotency lock с unique token и token-checked release;
+- HTML escaping для Telegram-сообщений;
+- классификация Telegram ошибок на retryable и permanent.
+
 ## API
 
-### POST /events
+### `POST /events`
 
-Создание и отправка события.
+Создает событие и отправляет его в RabbitMQ.
 
-**Тело запроса:**
-
-| Поле            | Тип    | Обязательное | Описание                                                                   |
-| --------------- | ------ | ------------ | -------------------------------------------------------------------------- |
-| type            | string | да           | Тип события (например, `notification.created`)                             |
-| payload.message | string | да           | Текст уведомления                                                          |
-| payload.chatId  | string | нет          | Telegram chat ID (если не указан, используется `TELEGRAM_DEFAULT_CHAT_ID`) |
-
-## Retry-механизм
-
-```
-Ошибка обработки → publishWithConfirm(retry queue) → ack original
-                                      │
-                                      ▼
-                            TTL retry queue
-                                      │
-                                      ▼
-                       DLX обратно в main exchange
-
-Permanent / retry exhausted → publishWithConfirm(parking queue) → ack original
+```json
+{
+  "type": "notification.created",
+  "payload": {
+    "message": "Notification text",
+    "chatId": "optional_chat_id"
+  }
+}
 ```
 
-- **Задержка**: fixed TTL retry queue (`RETRY_DELAY_MS`)
-- **MAX_RETRY_ATTEMPTS**: 3 (по умолчанию)
-- Любой перенос между очередями выполняется только после broker confirm
-- Если publish в retry/parking не подтвердился, оригинальное сообщение не ack'ается и requeue'ится
+Поля:
 
-## Идемпотентность
+- `type` — обязательная строка.
+- `payload.message` — обязательная строка.
+- `payload.chatId` — опциональная строка; если не передана, используется default chat id из env.
 
-Идемпотентность реализована с атомарным lock'ом через Redis:
+## Конфигурация
 
-1. **Проверка `processed:{eventId}`** — если запись существует, событие уже было обработано → ack
-2. **SET `processing:{eventId}` token NX EX 60** — атомарный lock. Если не удался → retryable error
-3. **Отправка в Telegram** — если успешно → `SET processed:{eventId} EX 86400` + token-checked lock release
-4. **При ошибке Telegram** — token-checked lock release → retry/parking flow
+Все переменные окружения перечислены в `.env.example`. Основные:
 
-Таким образом:
+- `RABBITMQ_URL`
+- `RABBITMQ_EXCHANGE`
+- `RABBITMQ_QUEUE`
+- `RABBITMQ_ROUTING_KEY`
+- `RABBITMQ_RETRY_EXCHANGE`
+- `RABBITMQ_RETRY_QUEUE`
+- `RABBITMQ_PARKING_EXCHANGE`
+- `RABBITMQ_PARKING_QUEUE`
+- `RABBITMQ_CONFIRM_TIMEOUT_MS`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_DEFAULT_CHAT_ID`
+- `TELEGRAM_REQUEST_TIMEOUT_MS`
+- `REDIS_URL`
+- `MAX_RETRY_ATTEMPTS`
+- `RETRY_DELAY_MS`
+- `PRODUCER_PORT`
 
-- Уже обработанные события не обрабатываются повторно
-- При одновременной обработке двумя consumer'ами lock выигрывает только один
-- При падении consumer'а во время обработки lock истечёт через 60 секунд, и событие придёт снова через RabbitMQ
+## Локальный запуск без Docker
 
-## Обработка ошибок
-
-| Сценарий                                    | Действие                                                 |
-| ------------------------------------------- | -------------------------------------------------------- |
-| Ошибка соединения с RabbitMQ (Producer)     | Reconnect с exponential backoff (до 10 попыток)          |
-| Ошибка соединения с RabbitMQ (Consumer)     | Reconnect с exponential backoff (до 10 попыток)          |
-| Retryable Telegram API/network error        | Publish в retry queue с confirm → ack original           |
-| Permanent Telegram/API/config error         | Publish в parking queue с confirm → ack original         |
-| Невалидное событие                          | Publish в parking queue с confirm → ack original         |
-| Уже обработанный eventId (processed)        | Событие подтверждается (ack), в лог пишется duplicate    |
-| in-flight duplicate (processing lock занят) | Retryable error → retry queue                            |
-| Превышено число retry                       | Publish в parking queue с confirm → ack original         |
-| TELEGRAM_BOT_TOKEN не задан                 | Consumer не стартует (fail-fast через config validation) |
-| Нет chatId в payload и default              | Permanent error → parking queue                          |
-
-## Переменные окружения
-
-| Переменная                     | По умолчанию                        | Описание                                                |
-| ------------------------------ | ----------------------------------- | ------------------------------------------------------- |
-| `RABBITMQ_URL`                 | `amqp://guest:guest@localhost:5672` | URL подключения к RabbitMQ                              |
-| `RABBITMQ_EXCHANGE`            | `notifications.exchange`            | Exchange                                                |
-| `RABBITMQ_QUEUE`               | `notifications.queue`               | Основная очередь                                        |
-| `RABBITMQ_ROUTING_KEY`         | `notifications.created`             | Routing key                                             |
-| `RABBITMQ_RETRY_EXCHANGE`      | `notifications.retry.exchange`      | Exchange для retry-сообщений                            |
-| `RABBITMQ_RETRY_QUEUE`         | `notifications.retry.queue`         | TTL retry queue                                         |
-| `RABBITMQ_RETRY_ROUTING_KEY`   | `notifications.retry`               | Routing key retry queue                                 |
-| `RABBITMQ_PARKING_EXCHANGE`    | `notifications.parking.exchange`    | Exchange для permanent failures                         |
-| `RABBITMQ_PARKING_QUEUE`       | `notifications.parking.queue`       | Parking queue                                           |
-| `RABBITMQ_PARKING_ROUTING_KEY` | `notifications.parking`             | Routing key parking queue                               |
-| `RABBITMQ_CONFIRM_TIMEOUT_MS`  | `5000`                              | Таймаут ожидания broker confirm                         |
-| `TELEGRAM_BOT_TOKEN`           | **обязательный**                    | Токен Telegram бота (fail-fast при отсутствии)          |
-| `TELEGRAM_DEFAULT_CHAT_ID`     | —                                   | Chat ID по умолчанию (если не указан в payload события) |
-| `TELEGRAM_REQUEST_TIMEOUT_MS`  | `5000`                              | Таймаут запроса к Telegram API                          |
-| `REDIS_URL`                    | `redis://localhost:6379`            | URL подключения к Redis                                 |
-| `MAX_RETRY_ATTEMPTS`           | `3`                                 | Максимум retry попыток                                  |
-| `RETRY_DELAY_MS`               | `2000`                              | Базовая задержка retry (ms)                             |
-| `PRODUCER_PORT`                | `3000`                              | Порт HTTP API Producer                                  |
-
-## Тестирование
+Нужны запущенные RabbitMQ и Redis.
 
 ```bash
-# Unit-тесты Producer
-npm run test -w apps/producer
+npm install
+npm run build -w shared
+npm run dev:producer
+npm run dev:consumer
+```
 
-# Unit-тесты Consumer
-npm run test -w apps/consumer
+## Тесты
 
-# E2E-тесты
+```bash
+npm run lint
+npm run build
+npm test
 npm run test:e2e
 ```
 
-## Запуск тестов
-
-```bash
-npm test
-```
+В CI дополнительно выполняется Docker build обоих сервисов.
 
 ## Структура проекта
 
-```
+```text
 fin_decisions/
 ├── apps/
-│   ├── producer/           # Producer Service (Nest.js)
-│   │   ├── src/
-│   │   │   ├── config/     # Конфигурация (env validation)
-│   │   │   ├── producer/   # HTTP API, DTO
-│   │   │   └── rabbitmq/   # RabbitMQ client
+│   ├── producer/
+│   │   ├── src/config/
+│   │   ├── src/producer/
+│   │   ├── src/rabbitmq/
 │   │   └── Dockerfile
-│   └── consumer/           # Consumer Service (Nest.js)
-│       ├── src/
-│       │   ├── config/     # Конфигурация (env validation)
-│       │   ├── consumer/   # Обработчик событий
-│       │   ├── rabbitmq/   # RabbitMQ consumer + retry/parking queues
-│       │   ├── redis/      # Redis client (idempotency)
-│       │   └── telegram/   # Telegram Bot API client
+│   └── consumer/
+│       ├── src/config/
+│       ├── src/consumer/
+│       ├── src/rabbitmq/
+│       ├── src/redis/
+│       ├── src/telegram/
 │       └── Dockerfile
-├── shared/                 # Shared types/interfaces
+├── shared/
 ├── docker-compose.yml
 └── .env.example
 ```
 
-## Технологический стек
+## Стек
 
-- **Node.js** 20+
-- **Nest.js** 11
-- **TypeScript**
-- **RabbitMQ** (через `amqplib`)
-- **Redis** (через `ioredis`)
-- **Telegram Bot API**
-- **Docker** / **Docker Compose**
-- **Jest** (тестирование)
+- Node.js 20
+- Nest.js 11
+- TypeScript
+- RabbitMQ / `amqplib`
+- Redis / `ioredis`
+- Telegram Bot API
+- Docker Compose
+- Jest
