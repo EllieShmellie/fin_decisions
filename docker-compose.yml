@@ -40,8 +40,6 @@ services:
       RABBITMQ_ROUTING_KEY: notifications.created
       RABBITMQ_CONFIRM_TIMEOUT_MS: 5000
       PRODUCER_PORT: 3000
-      MAX_RETRY_ATTEMPTS: 3
-      RETRY_DELAY_MS: 2000
     depends_on:
       rabbitmq:
         condition: service_healthy
