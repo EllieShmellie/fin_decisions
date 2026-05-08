@@ -33,12 +33,26 @@ const server = http.createServer(async (request, response) => {
   if (request.method === 'POST' && /^\/bot[^/]+\/sendMessage$/.test(request.url || '')) {
     const rawBody = await readBody(request);
     const parsedBody = rawBody ? JSON.parse(rawBody) : {};
+    const shouldFailPermanently =
+      typeof parsedBody.text === 'string' &&
+      parsedBody.text.includes('Integration permanent failure');
+
     requests.push({
       method: request.method,
       url: request.url,
       body: parsedBody,
+      responseStatus: shouldFailPermanently ? 403 : 200,
       receivedAt: new Date().toISOString(),
     });
+
+    if (shouldFailPermanently) {
+      sendJson(response, 403, {
+        ok: false,
+        error_code: 403,
+        description: 'Forbidden: integration permanent failure',
+      });
+      return;
+    }
 
     sendJson(response, 200, {
       ok: true,
